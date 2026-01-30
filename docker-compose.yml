@@ -7,7 +7,7 @@ services:
     command: ["sh", "-lc", "uv run alembic upgrade head && uv run gunicorn -c gunicorn_conf.py \"app.main:app\""]
     env_file: .env
     ports:
-      - "${PORT:-8080}:${PORT:-8080}"
+      - "${PORT:-8081}:${PORT:-8081}"
     volumes:
       - .:/app
       - ./log:/log
@@ -16,7 +16,7 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import os, ssl, urllib.request; port=os.environ.get('PORT','8080'); https=os.environ.get('HTTPS_ON','').lower() in ('true','1','yes'); scheme='https' if https else 'http'; url=f'{scheme}://localhost:{port}/healthz'; ctx=ssl._create_unverified_context() if https else None; urllib.request.urlopen(url, context=ctx).read()"]
+      test: ["CMD", "python", "-c", "import os, ssl, urllib.request; port=os.environ.get('PORT','8081'); https=os.environ.get('HTTPS_ON','').lower() in ('true','1','yes'); scheme='https' if https else 'http'; url=f'{scheme}://localhost:{port}/healthz'; ctx=ssl._create_unverified_context() if https else None; urllib.request.urlopen(url, context=ctx).read()"]
       interval: 10s
       timeout: 5s
       retries: 5

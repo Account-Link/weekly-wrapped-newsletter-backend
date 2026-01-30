@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     database_url: Optional[str] = Field(None, alias="DATABASE_URL")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     session_ttl_days: int = Field(30, alias="SESSION_TTL_DAYS")
-    port: int = Field(8080, alias="PORT")
+    port: int = Field(8081, alias="PORT")
     cors_allow_origins: str = Field("*", alias="CORS_ALLOW_ORIGINS")
     weekly_token: Optional[SecretStr] = Field(None, alias="WEEKLY_TOKEN")
     s3_bucket: Optional[str] = Field(None, alias="S3_BUCKET")

@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 # Auto-load .env so PORT and other settings are picked up.
 load_dotenv()
 
-bind = f"0.0.0.0:{os.getenv('PORT', '8080')}"
+bind = f"0.0.0.0:{os.getenv('PORT', '8081')}"
 workers = int(os.getenv("GUNICORN_WORKERS", multiprocessing.cpu_count() // 2 or 2))
 worker_class = os.getenv("GUNICORN_WORKER_CLASS", "uvicorn.workers.UvicornWorker")
 timeout = int(os.getenv("GUNICORN_TIMEOUT", "120"))

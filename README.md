@@ -28,8 +28,6 @@ Backend for the Weekly Wrapped Newsletter app. Uses FastAPI, SQLAlchemy + Alembi
 ## 线上域名
 [https://tee.feedling.app:8081/](https://tee.feedling.app:8081/)
 
-> **Note**: This project runs on port 8081 to avoid conflicts with the TikTok Wrapped Backend (port 8080) on the same server.
-
 ## ⚡ 快速开始
 
 **最快部署方式**（推荐）：
@@ -95,7 +93,6 @@ nano .env  # 编辑必填项：PORT, DATABASE_URL, SECRET_KEY, ARCHIVE_API_KEY
 # 1. 配置环境变量
 cp .env.example .env
 # 编辑 .env 文件，确保：
-# - PORT=8081 (避免与 TikTok Wrapped 的 8080 端口冲突)
 # - DATABASE_URL 使用独立的数据库名 (如 weekly_wrapped_newsletter)
 # - 其他必填配置项
 
@@ -134,11 +131,9 @@ cp .env.example .env
 docker compose run --rm web sh -lc "uv run alembic upgrade head"
 
 # 3. 启动服务
-docker compose up --build -d \
+docker compose -p weekly-wrapped-newsletter-backend up --build -d \
   --scale cron-worker=2 \
-  --scale cron-worker-watch=5 \
-  --scale cron-worker-auth=2 \
-  web cron-worker cron-worker-watch cron-worker-auth
+  web cron-worker
 ```
 
 > `web` 提供 API 服务；workers 运行 `app.worker` 处理异步任务。
@@ -186,18 +181,6 @@ docker compose up --build -d \
 - 错误处理使用统一的错误信封；Archive 错误映射待实现。
 - 配件选择使用 `items.csv`，包含在 wrapped payloads 中。
 - 如果与 TikTok Wrapped Backend 共存，请使用不同的数据库名。
-
-## 🔧 与 TikTok Wrapped 共存
-
-如果在同一服务器上运行两个项目：
-
-| 配置项 | TikTok Wrapped | Weekly Wrapped Newsletter |
-|--------|----------------|---------------------------|
-| 端口 | 8080 | **8081** |
-| 容器前缀 | `tk-wrapped-*` | `weekly-wrapped-*` |
-| 数据库 | `tk_wrapped` | `weekly_wrapped_newsletter` |
-
-详细对比请查看 [PROJECT_COMPARISON.md](./PROJECT_COMPARISON.md)。
 
 ## 🛠️ 常用命令
 
