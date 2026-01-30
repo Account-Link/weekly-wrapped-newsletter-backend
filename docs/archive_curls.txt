@@ -1,0 +1,120 @@
+# Archive curl cookbook (Xordi watch history + analytics)
+#
+# Required env:
+#   ARCHIVE_BASE_URL="https://archive.yourdomain.com"
+#   ARCHIVE_API_KEY="..."
+#   SEC_USER_ID="..."
+#
+# Optional env:
+#   LIMIT=200
+#   MAX_PAGES=3
+#   CURSOR_MS="1700000000000"        # ms epoch timestamp (string)
+#   TIME_ZONE="America/New_York"
+#   RANGE_START_AT="2025-01-01T00:00:00Z"
+#   RANGE_END_AT="2025-12-31T23:59:59Z"
+
+set -euo pipefail
+
+LIMIT="${LIMIT:-200}"
+MAX_PAGES="${MAX_PAGES:-3}"
+TIME_ZONE="${TIME_ZONE:-America/New_York}"
+
+if [[ -z "${ARCHIVE_BASE_URL:-}" || -z "${ARCHIVE_API_KEY:-}" || -z "${SEC_USER_ID:-}" ]]; then
+  echo "Missing required env: ARCHIVE_BASE_URL, ARCHIVE_API_KEY, SEC_USER_ID" >&2
+  exit 1
+fi
+
+if [[ -z "${CURSOR_MS:-}" ]]; then
+  CURSOR_MS="$(python - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+fi
+
+if [[ -z "${RANGE_START_AT:-}" ]]; then
+  RANGE_START_AT="2025-01-01T00:00:00Z"
+fi
+if [[ -z "${RANGE_END_AT:-}" ]]; then
+  RANGE_END_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
+
+echo "=== start watch-history scrape ==="
+START_JSON="$(jq -nc \
+  --arg sec_user_id "$SEC_USER_ID" \
+  --arg cursor "$CURSOR_MS" \
+  --argjson limit "$LIMIT" \
+  --argjson max_pages "$MAX_PAGES" \
+  '{sec_user_id:$sec_user_id,limit:$limit,max_pages:$max_pages,cursor:$cursor}'
+)"
+curl -sS -X POST "$ARCHIVE_BASE_URL/archive/xordi/watch-history/start" \
+  -H "X-Archive-API-Key: $ARCHIVE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$START_JSON" | jq -S .
+
+echo
+echo "Set DATA_JOB_ID from the response above:"
+echo "  export DATA_JOB_ID=\"...\""
+echo
+
+echo "=== poll finalize ==="
+echo "Tip: 202 means still processing; 200 means done."
+FINALIZE_JSON_TEMPLATE() {
+  jq -nc --arg data_job_id "$DATA_JOB_ID" '{data_job_id:$data_job_id,include_rows:false}'
+}
+cat <<'EOF'
+curl -sS -X POST "$ARCHIVE_BASE_URL/archive/xordi/watch-history/finalize" \
+  -H "X-Archive-API-Key: $ARCHIVE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -nc --arg data_job_id "$DATA_JOB_ID" '{data_job_id:$data_job_id,include_rows:false}')" | jq -S .
+EOF
+
+echo
+echo "=== analytics coverage ==="
+curl -sS "$ARCHIVE_BASE_URL/archive/xordi/watch-history/analytics/coverage?sec_user_id=$SEC_USER_ID" \
+  -H "X-Archive-API-Key: $ARCHIVE_API_KEY" | jq -S .
+
+echo
+echo "=== analytics summary (range between RANGE_START_AT/RANGE_END_AT) ==="
+SUMMARY_JSON="$(jq -nc \
+  --arg sec_user_id "$SEC_USER_ID" \
+  --arg time_zone "$TIME_ZONE" \
+  --arg start_at "$RANGE_START_AT" \
+  --arg end_at "$RANGE_END_AT" \
+  '{
+    sec_user_id:$sec_user_id,
+    time_zone:$time_zone,
+    range:{type:"between",start_at:$start_at,end_at:$end_at},
+    include_hour_histogram:false,
+    top_creators_limit:5,
+    top_music_limit:1
+  }'
+)"
+curl -sS -X POST "$ARCHIVE_BASE_URL/archive/xordi/watch-history/analytics/summary" \
+  -H "X-Archive-API-Key: $ARCHIVE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$SUMMARY_JSON" | jq -S .
+
+echo
+echo "=== analytics samples (per_month strategy) ==="
+SAMPLES_JSON="$(jq -nc \
+  --arg sec_user_id "$SEC_USER_ID" \
+  --arg time_zone "$TIME_ZONE" \
+  --arg start_at "$RANGE_START_AT" \
+  --arg end_at "$RANGE_END_AT" \
+  '{
+    sec_user_id:$sec_user_id,
+    time_zone:$time_zone,
+    range:{type:"between",start_at:$start_at,end_at:$end_at},
+    strategy:{type:"per_month",per_month:5},
+    limit:50,
+    max_chars_per_item:300,
+    fields:["title","description","hashtags","music","author"],
+    include_video_id:true,
+    include_watched_at:true
+  }'
+)"
+curl -sS -X POST "$ARCHIVE_BASE_URL/archive/xordi/watch-history/analytics/samples" \
+  -H "X-Archive-API-Key: $ARCHIVE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$SAMPLES_JSON" | jq -S .

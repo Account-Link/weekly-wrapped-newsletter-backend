@@ -1,0 +1,169 @@
+from datetime import datetime
+
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, JSON, String, Text
+from sqlalchemy.ext.mutable import MutableDict
+
+from .db import Base
+
+
+class AppUser(Base):
+    __tablename__ = "app_users"
+    app_user_id = Column(String, primary_key=True, index=True)
+    archive_user_id = Column(String, nullable=True)
+    latest_anchor_token = Column(String, nullable=True)
+    latest_sec_user_id = Column(String, nullable=True)
+    platform_username = Column(String, nullable=True)
+    is_watch_history_available = Column(String, nullable=False, default="unknown")
+    time_zone = Column(String, nullable=True)
+    waitlist_opt_in = Column(Boolean, nullable=False, default=False)
+    waitlist_opt_in_at = Column(DateTime, nullable=True)
+    referred_by = Column(String, nullable=True, index=True)
+    weekly_report_unsubscribed = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AppUserEmail(Base):
+    __tablename__ = "app_user_emails"
+    id = Column(String, primary_key=True)
+    app_user_id = Column(String, index=True)
+    email = Column(String, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    verified_at = Column(DateTime, nullable=True)
+
+
+class DeviceEmail(Base):
+    __tablename__ = "device_emails"
+    device_id = Column(String, primary_key=True)
+    email = Column(String, index=True, nullable=False)
+    referred_by = Column(String, index=True, nullable=True)
+    waitlist_opt_in = Column(Boolean, nullable=False, default=False)
+    waitlist_opt_in_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AppSession(Base):
+    __tablename__ = "app_sessions"
+    id = Column(String, primary_key=True)
+    app_user_id = Column(String, index=True)
+    device_id = Column(String, index=True)
+    platform = Column(String)
+    app_version = Column(String)
+    os_version = Column(String)
+    token_hash = Column(String, index=True)
+    token_encrypted = Column(String)
+    issued_at = Column(DateTime)
+    expires_at = Column(DateTime)
+    revoked_at = Column(DateTime, nullable=True)
+
+
+class AppAuthJob(Base):
+    __tablename__ = "app_auth_jobs"
+    archive_job_id = Column(String, primary_key=True)
+    app_user_id = Column(String, index=True, nullable=True)
+    provider = Column(String)  # x_cookie | xordi
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    status = Column(String, default="pending")  # pending|finalizing|finalized|failed|expired
+    last_error = Column(Text, nullable=True)
+    device_id = Column(String, nullable=True)
+    client_ip = Column(String, nullable=True)
+    email = Column(String, nullable=True, index=True)
+    platform = Column(String, nullable=True)
+    app_version = Column(String, nullable=True)
+    os_version = Column(String, nullable=True)
+    finalized_at = Column(DateTime, nullable=True)
+    session_id = Column(String, nullable=True)
+    redirect_clicked_at = Column(DateTime, nullable=True)
+    redirect_clicks = Column(Integer, default=0)
+
+
+class AppJob(Base):
+    __tablename__ = "app_jobs"
+    id = Column(String, primary_key=True)
+    task_name = Column(String, index=True)
+    payload = Column(JSON)
+    status = Column(String, default="pending")  # pending|running|succeeded|failed
+    attempts = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=5)
+    not_before = Column(DateTime, nullable=True)
+    idempotency_key = Column(String, nullable=True, index=True)
+    locked_by = Column(String, nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+    lease_seconds = Column(Integer, default=60)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AppWrappedRun(Base):
+    __tablename__ = "app_wrapped_runs"
+    id = Column(String, primary_key=True)
+    app_user_id = Column(String, index=True)
+    sec_user_id = Column(String, index=True)
+    archive_user_id = Column(String, index=True)
+    status = Column(String, default="pending")  # pending|ready|failed
+    email = Column(String, nullable=True)
+    token_hash = Column(String, nullable=True)
+    payload = Column(MutableDict.as_mutable(JSON), nullable=True)
+    watch_history_job_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Referral(Base):
+    __tablename__ = "referrals"
+    code = Column(String, primary_key=True)
+    referrer_app_user_id = Column(String, index=True)
+    impressions = Column(Integer, default=0)
+    conversions = Column(Integer, default=0)
+    completions = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ReferralEvent(Base):
+    __tablename__ = "referral_events"
+    id = Column(String, primary_key=True)
+    referrer_app_user_id = Column(String, index=True)
+    referred_app_user_id = Column(String, index=True, nullable=True)
+    event_type = Column(String)  # impression|conversion|completion
+    archive_job_id = Column(String, nullable=True)
+    wrapped_run_id = Column(String, nullable=True)
+    ip = Column(String, nullable=True)
+    user_agent = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WeeklyReport(Base):
+    __tablename__ = "weekly_report"
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    app_user_id = Column(String, index=True, nullable=False)
+    email_content = Column(Text, nullable=True)
+    period_start = Column(DateTime, nullable=True)  # 总结开始时间
+    period_end = Column(DateTime, nullable=True)  # 总结结束时间
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    send_status = Column(String, default="pending")  # pending|sent|failed
+    feeding_state = Column(String, nullable=True)  # curious|excited|cozy|sleepy|dizzy
+    trend_name = Column(String, nullable=True)
+    trend_type = Column(String, nullable=True)
+    discovery_rank = Column(Integer, nullable=True)
+    total_discoverers = Column(Integer, nullable=True)
+    origin_niche_text = Column(String, nullable=True)
+    spread_end_text = Column(String, nullable=True)
+    reach_start = Column(Float, nullable=True)
+    reach_end = Column(Float, nullable=True)
+    current_reach = Column(Float, nullable=True)
+    total_videos = Column(Integer, nullable=True)
+    total_time = Column(Integer, nullable=True)
+    pre_total_time = Column(Integer, nullable=True)
+    miles_scrolled = Column(Integer, nullable=True)
+    topics = Column(JSON, nullable=True)  # [{topic: string, pic_url: string}]
+    timezone = Column(String, nullable=True)
+    rabbit_hole_datetime = Column(DateTime, nullable=True)
+    rabbit_hole_date = Column(String, nullable=True)
+    rabbit_hole_time = Column(String, nullable=True)
+    rabbit_hole_count = Column(Integer, nullable=True)
+    rabbit_hole_category = Column(String, nullable=True)
+    nudge_text = Column(String, nullable=True)

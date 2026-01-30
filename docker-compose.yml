@@ -1,0 +1,91 @@
+name: weekly-wrapped-newsletter-backend
+
+services:
+  web:
+    build: .
+    container_name: weekly-wrapped-web
+    command: ["sh", "-lc", "uv run alembic upgrade head && uv run gunicorn -c gunicorn_conf.py \"app.main:app\""]
+    env_file: .env
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - .:/app
+      - ./log:/log
+      - /home/ubuntu/certbot:/certbot:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, ssl, urllib.request; port=os.environ.get('PORT','8080'); https=os.environ.get('HTTPS_ON','').lower() in ('true','1','yes'); scheme='https' if https else 'http'; url=f'{scheme}://localhost:{port}/healthz'; ctx=ssl._create_unverified_context() if https else None; urllib.request.urlopen(url, context=ctx).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  cron-scheduler:
+    build: .
+    container_name: weekly-wrapped-scheduler
+    command: ["sh", "-lc", "uv run python -m app.worker"]
+    env_file: .env
+    environment:
+      - WORKER_JOB_CONCURRENCY=10
+    volumes:
+      - .:/app
+      - ./log:/log
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+
+  cron-worker:
+    build: .
+    command: ["sh", "-lc", "uv run python -m app.worker"]
+    env_file: .env
+    environment:
+      - WORKER_TASK_ALLOW=wrapped_analysis,email_send,watch_history_verify,reauth_notify,llm_personality,llm_personality_explanation,llm_niche_journey,llm_top_niche_percentile,llm_brainrot,llm_brainrot_explanation,llm_keyword_2026,llm_thumb_roast
+      - WORKER_JOB_CONCURRENCY=10
+    volumes:
+      - .:/app
+      - ./log:/log
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+
+  cron-worker-watch:
+    build: .
+    command: ["sh", "-lc", "uv run python -m app.worker"]
+    env_file: .env
+    environment:
+      - WORKER_TASK_ALLOW=watch_history_fetch_2025
+      - WORKER_JOB_CONCURRENCY=10
+    volumes:
+      - .:/app
+      - ./log:/log
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+
+  cron-worker-auth:
+    build: .
+    command: ["sh", "-lc", "uv run python -m app.worker"]
+    env_file: .env
+    environment:
+      - WORKER_TASK_ALLOW=xordi_finalize
+      - WORKER_JOB_CONCURRENCY=10
+    volumes:
+      - .:/app
+      - ./log:/log
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy

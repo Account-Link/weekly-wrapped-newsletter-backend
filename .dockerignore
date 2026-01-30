@@ -1,0 +1,31 @@
+.git
+.gitignore
+
+# Local env / secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Virtualenvs
+.venv
+.venv/
+venv
+venv/
+env
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Logs and local artifacts
+log/
+*.log
+*.db
+.DS_Store
+.idea/
+.vscode/
+

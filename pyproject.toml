@@ -1,0 +1,35 @@
+[project]
+name = "tk-wrapped-backend"
+version = "0.1.0"
+description = "TikTok Wrapped backend (Archive/Xordi reference-aligned scaffold)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "gunicorn>=21.2.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "python-dotenv>=1.0.0",
+    "SQLAlchemy>=2.0.30",
+    "alembic>=1.13.0",
+    "itsdangerous>=2.1.2",
+    "cryptography>=42.0.0",
+    "psycopg[binary]>=3.1.18",
+    "boto3>=1.35.0",
+    "psycopg2-binary>=2.9.9",
+    "email-validator>=2.2.0",
+    "python-multipart>=0.0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "mypy>=1.10.0",
+    "types-python-dateutil",
+]
+
+[tool.uv]
+exclude-newer = "2024-12-01T00:00:00Z"
