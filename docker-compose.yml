@@ -26,12 +26,12 @@ services:
           "CMD",
           "python",
           "-c",
-          "import os, ssl, urllib.request; port=os.environ.get('PORT','8081'); https=os.environ.get('HTTPS_ON','').lower() in ('true','1','yes'); scheme='https' if https else 'http'; url=f'{scheme}://localhost:{port}/healthz'; ctx=ssl._create_unverified_context() if https else None; urllib.request.urlopen(url, context=ctx).read()",
+          "import os, urllib.request; port=os.environ.get('PORT','8081'); urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=5).read()",
         ]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 45s
 
   cron-scheduler:
     build: .
