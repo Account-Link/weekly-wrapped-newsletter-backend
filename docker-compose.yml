@@ -11,6 +11,10 @@ services:
         'uv run gunicorn -c gunicorn_conf.py "app.main:app"',
       ]
     env_file: .env
+    environment:
+      # Log to stdout/stderr so we see worker boot errors and avoid reentrant file logging
+      - GUNICORN_ACCESS_LOG=-
+      - GUNICORN_ERROR_LOG=-
     ports:
       - "${PORT:-8081}:${PORT:-8081}"
     volumes:
