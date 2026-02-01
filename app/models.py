@@ -135,16 +135,34 @@ class ReferralEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class WeeklyReportGlobal(Base):
+    """Global weekly report for all users - stores aggregated analysis results."""
+    __tablename__ = "weekly_report_global"
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    period_start = Column(DateTime, nullable=False, index=True)  # 周一 00:00 UTC
+    period_end = Column(DateTime, nullable=False)  # 下周一 00:00 UTC
+    total_users = Column(Integer, nullable=True)  # 参与分析的用户数
+    total_videos = Column(Integer, nullable=True)  # 所有用户观看视频总数
+    total_watch_hours = Column(Float, nullable=True)  # 所有用户观看时长总计
+    analysis_result = Column(JSON, nullable=True)  # 整体分析结果 (预留, 可存任意分析数据)
+    status = Column(String, default="pending", index=True)  # pending|fetching|analyzing|sending|completed|failed
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class WeeklyReport(Base):
     __tablename__ = "weekly_report"
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     app_user_id = Column(String, index=True, nullable=False)
+    global_report_id = Column(Integer, nullable=True, index=True)  # 关联到 WeeklyReportGlobal
     email_content = Column(Text, nullable=True)
     period_start = Column(DateTime, nullable=True)  # 总结开始时间
     period_end = Column(DateTime, nullable=True)  # 总结结束时间
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     send_status = Column(String, default="pending")  # pending|sent|failed
+    fetch_status = Column(String, default="pending")  # pending|fetching|fetched|failed
+    analyze_status = Column(String, default="pending")  # pending|analyzing|analyzed|failed
     feeding_state = Column(String, nullable=True)  # curious|excited|cozy|sleepy|dizzy
     trend_name = Column(String, nullable=True)
     trend_type = Column(String, nullable=True)
@@ -167,3 +185,36 @@ class WeeklyReport(Base):
     rabbit_hole_count = Column(Integer, nullable=True)
     rabbit_hole_category = Column(String, nullable=True)
     nudge_text = Column(String, nullable=True)
+
+class OutfitCatalog(Base, BaseModel):
+    __tablename__ = "f_outfit_catalog"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+
+    entity_item_treasure_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    internal_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    set_series: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    quality: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    internal_name_accessory: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    internal_name_overlay: Mapped[str] = mapped_column(String(255), nullable=False)
+    name_display_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    belongs_to_series: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    description_cn: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    description_en: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    is_stackable: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    appraised_state: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Future: CDN image URL
+    pic: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+
+    __table_args__ = (
+        Index("ix_f_outfit_catalog_overlay", "internal_name_overlay", unique=True),
+    )

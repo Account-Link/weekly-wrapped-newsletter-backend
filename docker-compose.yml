@@ -55,8 +55,8 @@ services:
     command: ["sh", "-lc", "uv run python -m app.worker"]
     env_file: .env
     environment:
-      - WORKER_TASK_ALLOW=wrapped_analysis,email_send,watch_history_verify,reauth_notify,llm_personality,llm_personality_explanation,llm_niche_journey,llm_top_niche_percentile,llm_brainrot,llm_brainrot_explanation,llm_keyword_2026,llm_thumb_roast,weekly_report_analyze
-      # - WORKER_TASK_ALLOW=wrapped_analysis,email_send,watch_history_verify,reauth_notify,llm_personality,llm_personality_explanation,llm_niche_journey,llm_top_niche_percentile,llm_brainrot,llm_brainrot_explanation,llm_keyword_2026,llm_thumb_roast,weekly_report_analyze,weekly_report_send
+      # NOTE: 邮件发送任务已禁用。需要发送时，将 email_send / weekly_report_send 加回。
+      - WORKER_TASK_ALLOW=wrapped_analysis,watch_history_verify,reauth_notify,llm_personality,llm_personality_explanation,llm_niche_journey,llm_top_niche_percentile,llm_brainrot,llm_brainrot_explanation,llm_keyword_2026,llm_thumb_roast,weekly_report_analyze
       - WORKER_JOB_CONCURRENCY=10
     volumes:
       - .:/app

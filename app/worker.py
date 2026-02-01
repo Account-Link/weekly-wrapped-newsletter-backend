@@ -19,7 +19,7 @@ from sqlalchemy import func
 from app import accessories
 from app.db import SessionLocal
 from app.emailer import Emailer
-from app.models import AppAuthJob, AppJob, AppSession, AppUser, AppUserEmail, AppWrappedRun, DeviceEmail, Referral, ReferralEvent, WeeklyReport
+from app.models import AppAuthJob, AppJob, AppSession, AppUser, AppUserEmail, AppWrappedRun, DeviceEmail, Referral, ReferralEvent, WeeklyReport, WeeklyReportGlobal
 from app.observability import bind_context, clear_context, get_logger, sanitize_json_text, set_service, setup_logging
 from app.prompts import (
     ACCESSORY_SET_PROMPT,
@@ -3383,14 +3383,20 @@ async def handle_weekly_report_analyze(job: LeasedJob) -> bool:
                     return
                 cursor_ms = next_cursor_ms
 
-        if not await _coverage_ok():
+        # Try to fetch data if coverage is incomplete
+        coverage_complete = await _coverage_ok()
+        if not coverage_complete:
             await _fetch_until_week_start()
-            if not await _coverage_ok():
-                logger.info(
-                    "weekly_report_analyze.coverage_incomplete",
-                    extra={"event": "weekly_report_analyze.coverage_incomplete", "app_user_id": app_user_id},
-                )
-                return True
+            coverage_complete = await _coverage_ok()
+        
+        # RELAXED: Even if coverage is incomplete, continue processing with available data
+        # This allows users with partial week data to still receive reports
+        if not coverage_complete:
+            logger.info(
+                "weekly_report_analyze.coverage_incomplete",
+                extra={"event": "weekly_report_analyze.coverage_incomplete", "app_user_id": app_user_id},
+            )
+            # Continue processing instead of returning early
 
         range_spec: Dict[str, Any] = {"type": "between", "start_at": _iso_utc(week_start), "end_at": _iso_utc(window_end)}
         summary: Optional[Dict[str, Any]] = None
@@ -3713,6 +3719,935 @@ async def handle_weekly_report_send(job: LeasedJob) -> bool:
     return sent_ok
 
 
+# ============================================================================
+# Weekly Report Batch Processing Handlers
+# ============================================================================
+
+
+def _get_week_boundaries() -> tuple[datetime, datetime]:
+    """Get the start and end of the current week (Monday 00:00 UTC to next Monday 00:00 UTC)."""
+    now = datetime.now(timezone.utc)
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + timedelta(days=7)
+    return week_start, week_end
+
+
+def _get_or_create_global_report(db, week_start: datetime, week_end: datetime) -> WeeklyReportGlobal:
+    """Get or create a global report for the given week."""
+    global_report = (
+        db.query(WeeklyReportGlobal)
+        .filter(
+            WeeklyReportGlobal.period_start == week_start,
+            WeeklyReportGlobal.period_end == week_end,
+        )
+        .first()
+    )
+    if not global_report:
+        global_report = WeeklyReportGlobal(
+            period_start=week_start,
+            period_end=week_end,
+            status="pending",
+        )
+        db.add(global_report)
+        db.commit()
+        db.refresh(global_report)
+    return global_report
+
+
+async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
+    """Coordinator job: Create fetch jobs for all eligible users, then trigger global analysis.
+    
+    This job:
+    1. Creates a WeeklyReportGlobal record for this week
+    2. Creates WeeklyReport records for each eligible user
+    3. Enqueues weekly_report_user_fetch jobs for each user
+    4. Polls until all fetch jobs are complete
+    5. Enqueues weekly_report_global_analyze job
+    """
+    week_start, week_end = _get_week_boundaries()
+    
+    with SessionLocal() as db:
+        # Get or create global report
+        global_report = _get_or_create_global_report(db, week_start, week_end)
+        global_report_id = global_report.id
+        
+        # Update status to fetching
+        global_report.status = "fetching"
+        db.add(global_report)
+        db.commit()
+        
+        # Query eligible users
+        users = (
+            db.query(AppUser)
+            .filter(
+                AppUser.weekly_report_unsubscribed == False,
+                AppUser.latest_sec_user_id.isnot(None),
+                AppUser.latest_sec_user_id != "",
+            )
+            .all()
+        )
+        
+        if not users:
+            logger.info(
+                "weekly_report_batch_fetch.no_users",
+                extra={"event": "weekly_report_batch_fetch.no_users", "global_report_id": global_report_id},
+            )
+            global_report.status = "completed"
+            global_report.total_users = 0
+            db.add(global_report)
+            db.commit()
+            return True
+        
+        # Create/update WeeklyReport records and enqueue fetch jobs
+        user_report_ids = []
+        for user in users:
+            # Check for existing report this week
+            existing_report = (
+                db.query(WeeklyReport)
+                .filter(
+                    WeeklyReport.app_user_id == user.app_user_id,
+                    WeeklyReport.global_report_id == global_report_id,
+                )
+                .first()
+            )
+            
+            if existing_report:
+                report = existing_report
+            else:
+                # Check if there's a report for this week without global_report_id
+                existing_report = (
+                    db.query(WeeklyReport)
+                    .filter(
+                        WeeklyReport.app_user_id == user.app_user_id,
+                        WeeklyReport.period_start == week_start,
+                    )
+                    .first()
+                )
+                if existing_report:
+                    report = existing_report
+                    report.global_report_id = global_report_id
+                else:
+                    report = WeeklyReport(
+                        app_user_id=user.app_user_id,
+                        global_report_id=global_report_id,
+                        period_start=week_start,
+                        period_end=week_end,
+                        send_status="pending",
+                        fetch_status="pending",
+                        analyze_status="pending",
+                    )
+            
+            report.fetch_status = "pending"
+            db.add(report)
+            db.commit()
+            db.refresh(report)
+            user_report_ids.append((user.app_user_id, report.id))
+            
+            # Enqueue fetch job
+            job_queue.enqueue(
+                db,
+                task_name="weekly_report_user_fetch",
+                payload={
+                    "app_user_id": user.app_user_id,
+                    "report_id": report.id,
+                    "global_report_id": global_report_id,
+                },
+                idempotency_key=f"weekly_report_user_fetch:{global_report_id}:{user.app_user_id}",
+            )
+        
+        global_report.total_users = len(users)
+        db.add(global_report)
+        db.commit()
+        
+        logger.info(
+            "weekly_report_batch_fetch.enqueued",
+            extra={
+                "event": "weekly_report_batch_fetch.enqueued",
+                "global_report_id": global_report_id,
+                "total_users": len(users),
+            },
+        )
+    
+    # Poll until all fetch jobs complete
+    max_wait_seconds = float(os.getenv("WEEKLY_REPORT_BATCH_FETCH_MAX_WAIT_SECONDS", "3600"))
+    poll_interval = float(os.getenv("WEEKLY_REPORT_BATCH_POLL_INTERVAL_SECONDS", "10"))
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_seconds:
+        await asyncio.sleep(poll_interval)
+        
+        with SessionLocal() as db:
+            # Check how many reports are still fetching
+            pending_count = (
+                db.query(func.count(WeeklyReport.id))
+                .filter(
+                    WeeklyReport.global_report_id == global_report_id,
+                    WeeklyReport.fetch_status.in_(["pending", "fetching"]),
+                )
+                .scalar()
+            )
+            
+            if pending_count == 0:
+                logger.info(
+                    "weekly_report_batch_fetch.all_fetched",
+                    extra={
+                        "event": "weekly_report_batch_fetch.all_fetched",
+                        "global_report_id": global_report_id,
+                    },
+                )
+                
+                # Enqueue global analyze job
+                job_queue.enqueue(
+                    db,
+                    task_name="weekly_report_global_analyze",
+                    payload={"global_report_id": global_report_id},
+                    idempotency_key=f"weekly_report_global_analyze:{global_report_id}",
+                )
+                return True
+    
+    # Timeout - still proceed to global analysis
+    logger.warning(
+        "weekly_report_batch_fetch.timeout",
+        extra={
+            "event": "weekly_report_batch_fetch.timeout",
+            "global_report_id": global_report_id,
+            "elapsed_seconds": time.time() - start_time,
+        },
+    )
+    
+    with SessionLocal() as db:
+        job_queue.enqueue(
+            db,
+            task_name="weekly_report_global_analyze",
+            payload={"global_report_id": global_report_id},
+            idempotency_key=f"weekly_report_global_analyze:{global_report_id}",
+        )
+    
+    return True
+
+
+async def handle_weekly_report_user_fetch(job: LeasedJob) -> bool:
+    """Fetch watch history data for a single user.
+    
+    This job fetches data until week_start is covered, marking fetch_status accordingly.
+    Even if coverage is incomplete, we continue with available data.
+    """
+    app_user_id = job.payload.get("app_user_id")
+    report_id = job.payload.get("report_id")
+    global_report_id = job.payload.get("global_report_id")
+    
+    if not app_user_id or not report_id:
+        return True
+    
+    with SessionLocal() as db:
+        user = db.get(AppUser, app_user_id)
+        if not user:
+            return True
+        if not user.latest_sec_user_id:
+            logger.warning(
+                "weekly_report_user_fetch.missing_sec_user_id",
+                extra={"event": "weekly_report_user_fetch.missing_sec_user_id", "app_user_id": app_user_id},
+            )
+            return True
+        
+        report = db.get(WeeklyReport, report_id)
+        if not report:
+            return True
+        
+        # Mark as fetching
+        report.fetch_status = "fetching"
+        db.add(report)
+        db.commit()
+        
+        week_start = report.period_start
+        week_end = report.period_end
+        if not week_start or not week_end:
+            week_start, week_end = _get_week_boundaries()
+            report.period_start = week_start
+            report.period_end = week_end
+        
+        now = datetime.now(timezone.utc)
+        window_end = min(week_end, now)
+        
+        async def _coverage_ok() -> bool:
+            """Check if we have data coverage for the entire week."""
+            try:
+                coverage = await archive_client.watch_history_analytics_coverage(sec_user_id=user.latest_sec_user_id)
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_fetch.coverage_failed",
+                    extra={"event": "weekly_report_user_fetch.coverage_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
+                return False
+            watched_min = _parse_iso_datetime(coverage.get("watched_at_min")) if isinstance(coverage, dict) else None
+            watched_max = _parse_iso_datetime(coverage.get("watched_at_max")) if isinstance(coverage, dict) else None
+            if not watched_min or not watched_max:
+                return False
+            grace_hours = float(os.getenv("WEEKLY_REPORT_COVERAGE_GRACE_HOURS", "0") or 0)
+            grace = timedelta(hours=max(0.0, grace_hours))
+            return watched_min <= week_start and watched_max >= (window_end - grace)
+        
+        async def _fetch_until_week_start() -> None:
+            """Fetch watch history data until we cover week_start."""
+            max_jobs = max(1, int(os.getenv("WEEKLY_REPORT_FETCH_MAX_DATA_JOBS", "8")))
+            cursor_ms = None
+            target_ms = int(week_start.timestamp() * 1000)
+            completed = 0
+            while completed < max_jobs:
+                start_resp = await archive_client.start_watch_history(
+                    sec_user_id=user.latest_sec_user_id,
+                    limit=WATCH_HISTORY_PAGE_LIMIT,
+                    max_pages=WATCH_HISTORY_MAX_PAGES,
+                    cursor=str(cursor_ms) if cursor_ms is not None else None,
+                )
+                if start_resp.status_code != 202:
+                    if start_resp.status_code in (400, 401, 403, 404):
+                        return
+                    await asyncio.sleep(1)
+                    continue
+                with suppress(Exception):
+                    start_data = start_resp.json()
+                data_job_id = start_data.get("data_job_id") if isinstance(start_data, dict) else None
+                if not data_job_id:
+                    return
+                
+                fin_ok = False
+                fin_data: Dict[str, Any] = {}
+                backoff = 1.0
+                for _ in range(60):
+                    fin = await archive_client.finalize_watch_history(data_job_id=data_job_id, include_rows=False)
+                    if fin.status_code == 202:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 8.0)
+                        continue
+                    if fin.status_code == 200:
+                        with suppress(Exception):
+                            fin_data = fin.json()
+                        fin_ok = True
+                    break
+                
+                if not fin_ok:
+                    return
+                
+                completed += 1
+                pagination = fin_data.get("pagination", {}) if isinstance(fin_data, dict) else {}
+                next_cursor = pagination.get("next_cursor")
+                has_more = pagination.get("has_more")
+                next_cursor_ms = None
+                with suppress(Exception):
+                    next_cursor_ms = int(next_cursor) if next_cursor is not None else None
+                if not next_cursor_ms or has_more is False or next_cursor_ms <= target_ms:
+                    return
+                cursor_ms = next_cursor_ms
+        
+        # Try to fetch data
+        coverage_complete = await _coverage_ok()
+        if not coverage_complete:
+            await _fetch_until_week_start()
+            coverage_complete = await _coverage_ok()
+        
+        # RELAXED: Even if coverage is incomplete, mark as fetched and continue
+        # The analysis phase will work with whatever data is available
+        if not coverage_complete:
+            logger.info(
+                "weekly_report_user_fetch.coverage_incomplete",
+                extra={
+                    "event": "weekly_report_user_fetch.coverage_incomplete",
+                    "app_user_id": app_user_id,
+                    "report_id": report_id,
+                },
+            )
+        
+        report.fetch_status = "fetched"
+        db.add(report)
+        db.commit()
+        
+        logger.info(
+            "weekly_report_user_fetch.completed",
+            extra={
+                "event": "weekly_report_user_fetch.completed",
+                "app_user_id": app_user_id,
+                "report_id": report_id,
+                "coverage_complete": coverage_complete,
+            },
+        )
+    
+    return True
+
+
+async def handle_weekly_report_global_analyze(job: LeasedJob) -> bool:
+    """Perform global analysis across all users' data, then trigger batch analyze.
+    
+    This job:
+    1. Aggregates data from all users' fetched data
+    2. Performs global analysis (placeholder for now)
+    3. Saves results to WeeklyReportGlobal.analysis_result
+    4. Triggers weekly_report_batch_analyze job
+    """
+    global_report_id = job.payload.get("global_report_id")
+    if not global_report_id:
+        return True
+    
+    with SessionLocal() as db:
+        global_report = db.get(WeeklyReportGlobal, global_report_id)
+        if not global_report:
+            return True
+        
+        # Update status to analyzing
+        global_report.status = "analyzing"
+        db.add(global_report)
+        db.commit()
+        
+        # Aggregate data from all user reports
+        user_reports = (
+            db.query(WeeklyReport)
+            .filter(
+                WeeklyReport.global_report_id == global_report_id,
+                WeeklyReport.fetch_status == "fetched",
+            )
+            .all()
+        )
+        
+        # Calculate aggregate statistics
+        total_videos = 0
+        total_time_seconds = 0
+        fetched_users = len(user_reports)
+        
+        for report in user_reports:
+            if report.total_videos:
+                total_videos += report.total_videos
+            if report.total_time:
+                total_time_seconds += report.total_time
+        
+        total_watch_hours = total_time_seconds / 3600.0 if total_time_seconds > 0 else 0.0
+        
+        # TODO: Implement actual global analysis logic here
+        # This is a placeholder - can add:
+        # - Average watch time per user
+        # - Global trending topics
+        # - User percentile calculations
+        # - Cross-user pattern detection
+        analysis_result = {
+            "fetched_users": fetched_users,
+            "total_videos": total_videos,
+            "total_watch_hours": round(total_watch_hours, 2),
+            "avg_videos_per_user": round(total_videos / fetched_users, 2) if fetched_users > 0 else 0,
+            "avg_watch_hours_per_user": round(total_watch_hours / fetched_users, 2) if fetched_users > 0 else 0,
+            # Placeholder for future analysis fields
+            "trending_topics": [],
+            "global_patterns": {},
+        }
+        
+        global_report.total_videos = total_videos
+        global_report.total_watch_hours = total_watch_hours
+        global_report.analysis_result = analysis_result
+        db.add(global_report)
+        db.commit()
+        
+        logger.info(
+            "weekly_report_global_analyze.completed",
+            extra={
+                "event": "weekly_report_global_analyze.completed",
+                "global_report_id": global_report_id,
+                "fetched_users": fetched_users,
+                "total_videos": total_videos,
+                "total_watch_hours": round(total_watch_hours, 2),
+            },
+        )
+        
+        # Enqueue batch analyze job
+        job_queue.enqueue(
+            db,
+            task_name="weekly_report_batch_analyze",
+            payload={"global_report_id": global_report_id},
+            idempotency_key=f"weekly_report_batch_analyze:{global_report_id}",
+        )
+    
+    return True
+
+
+async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
+    """Coordinator job: Create analyze jobs for all users, then trigger batch send.
+    
+    This job:
+    1. Enqueues weekly_report_user_analyze jobs for each user
+    2. Polls until all analyze jobs are complete
+    3. Enqueues weekly_report_batch_send job
+    """
+    global_report_id = job.payload.get("global_report_id")
+    if not global_report_id:
+        return True
+    
+    with SessionLocal() as db:
+        global_report = db.get(WeeklyReportGlobal, global_report_id)
+        if not global_report:
+            return True
+        
+        # Get all user reports that were fetched
+        user_reports = (
+            db.query(WeeklyReport)
+            .filter(
+                WeeklyReport.global_report_id == global_report_id,
+                WeeklyReport.fetch_status == "fetched",
+            )
+            .all()
+        )
+        
+        if not user_reports:
+            logger.info(
+                "weekly_report_batch_analyze.no_reports",
+                extra={
+                    "event": "weekly_report_batch_analyze.no_reports",
+                    "global_report_id": global_report_id,
+                },
+            )
+            global_report.status = "completed"
+            db.add(global_report)
+            db.commit()
+            return True
+        
+        # Enqueue analyze jobs for each user
+        for report in user_reports:
+            report.analyze_status = "pending"
+            db.add(report)
+            
+            job_queue.enqueue(
+                db,
+                task_name="weekly_report_user_analyze",
+                payload={
+                    "app_user_id": report.app_user_id,
+                    "report_id": report.id,
+                    "global_report_id": global_report_id,
+                },
+                idempotency_key=f"weekly_report_user_analyze:{global_report_id}:{report.app_user_id}",
+            )
+        
+        db.commit()
+        
+        logger.info(
+            "weekly_report_batch_analyze.enqueued",
+            extra={
+                "event": "weekly_report_batch_analyze.enqueued",
+                "global_report_id": global_report_id,
+                "total_reports": len(user_reports),
+            },
+        )
+    
+    # Poll until all analyze jobs complete
+    max_wait_seconds = float(os.getenv("WEEKLY_REPORT_BATCH_ANALYZE_MAX_WAIT_SECONDS", "7200"))
+    poll_interval = float(os.getenv("WEEKLY_REPORT_BATCH_POLL_INTERVAL_SECONDS", "10"))
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_seconds:
+        await asyncio.sleep(poll_interval)
+        
+        with SessionLocal() as db:
+            # Check how many reports are still analyzing
+            pending_count = (
+                db.query(func.count(WeeklyReport.id))
+                .filter(
+                    WeeklyReport.global_report_id == global_report_id,
+                    WeeklyReport.analyze_status.in_(["pending", "analyzing"]),
+                )
+                .scalar()
+            )
+            
+            if pending_count == 0:
+                logger.info(
+                    "weekly_report_batch_analyze.all_analyzed",
+                    extra={
+                        "event": "weekly_report_batch_analyze.all_analyzed",
+                        "global_report_id": global_report_id,
+                    },
+                )
+                
+                # Enqueue batch send job
+                job_queue.enqueue(
+                    db,
+                    task_name="weekly_report_batch_send",
+                    payload={"global_report_id": global_report_id},
+                    idempotency_key=f"weekly_report_batch_send:{global_report_id}",
+                )
+                return True
+    
+    # Timeout - still proceed to send
+    logger.warning(
+        "weekly_report_batch_analyze.timeout",
+        extra={
+            "event": "weekly_report_batch_analyze.timeout",
+            "global_report_id": global_report_id,
+            "elapsed_seconds": time.time() - start_time,
+        },
+    )
+    
+    with SessionLocal() as db:
+        job_queue.enqueue(
+            db,
+            task_name="weekly_report_batch_send",
+            payload={"global_report_id": global_report_id},
+            idempotency_key=f"weekly_report_batch_send:{global_report_id}",
+        )
+    
+    return True
+
+
+async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
+    """Analyze a single user's data, generate HTML, and save to DB.
+    
+    This is similar to the original handle_weekly_report_analyze but:
+    - Uses existing fetched data (no re-fetching)
+    - Can access global analysis results from WeeklyReportGlobal
+    - Updates analyze_status instead of doing everything in one go
+    """
+    app_user_id = job.payload.get("app_user_id")
+    report_id = job.payload.get("report_id")
+    global_report_id = job.payload.get("global_report_id")
+    
+    if not app_user_id or not report_id:
+        return True
+    
+    with SessionLocal() as db:
+        user = db.get(AppUser, app_user_id)
+        if not user:
+            return True
+        if not user.latest_sec_user_id:
+            logger.warning(
+                "weekly_report_user_analyze.missing_sec_user_id",
+                extra={"event": "weekly_report_user_analyze.missing_sec_user_id", "app_user_id": app_user_id},
+            )
+            return True
+        
+        report = db.get(WeeklyReport, report_id)
+        if not report:
+            return True
+        
+        # Mark as analyzing
+        report.analyze_status = "analyzing"
+        db.add(report)
+        db.commit()
+        
+        # Get global analysis result (if available) for potential use in per-user analysis
+        global_analysis: Dict[str, Any] = {}
+        if global_report_id:
+            global_report = db.get(WeeklyReportGlobal, global_report_id)
+            if global_report and global_report.analysis_result:
+                global_analysis = global_report.analysis_result
+        
+        week_start = report.period_start
+        week_end = report.period_end
+        if not week_start or not week_end:
+            week_start, week_end = _get_week_boundaries()
+            report.period_start = week_start
+            report.period_end = week_end
+        
+        now = datetime.now(timezone.utc)
+        window_end = min(week_end, now)
+        
+        range_spec: Dict[str, Any] = {"type": "between", "start_at": _iso_utc(week_start), "end_at": _iso_utc(window_end)}
+        summary: Optional[Dict[str, Any]] = None
+        
+        try:
+            summary = await archive_client.watch_history_analytics_summary(
+                sec_user_id=user.latest_sec_user_id,
+                range=range_spec,
+                time_zone=user.time_zone or "UTC",
+                include_hour_histogram=False,
+                top_creators_limit=5,
+                top_music_limit=1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_user_analyze.summary_failed",
+                extra={"event": "weekly_report_user_analyze.summary_failed", "app_user_id": app_user_id, "error": str(exc)},
+            )
+            report.analyze_status = "failed"
+            db.add(report)
+            db.commit()
+            return True
+        
+        try:
+            totals = summary.get("totals") if isinstance(summary, dict) else None
+            total_videos = int(totals.get("videos") or 0) if isinstance(totals, dict) else 0
+            total_hours = float(totals.get("watch_hours") or 0.0) if isinstance(totals, dict) else 0.0
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_user_analyze.summary_shape",
+                extra={"event": "weekly_report_user_analyze.summary_shape", "app_user_id": app_user_id, "error": str(exc)},
+            )
+            report.analyze_status = "failed"
+            db.add(report)
+            db.commit()
+            return True
+        
+        report.total_videos = total_videos
+        report.total_time = int(round(total_hours * 3600))
+        report.timezone = user.time_zone or "UTC"
+        
+        # Calculate miles_scrolled (estimate: ~3 inches per video swipe, converted to miles)
+        report.miles_scrolled = int(round(total_videos * 0.0000473485 * 1000))
+        
+        # Get previous week's total_time for comparison
+        prev_week_start = week_start - timedelta(days=7)
+        prev_report = (
+            db.query(WeeklyReport)
+            .filter(
+                WeeklyReport.app_user_id == app_user_id,
+                WeeklyReport.period_start.isnot(None),
+                WeeklyReport.period_start >= prev_week_start,
+                WeeklyReport.period_start < week_start,
+            )
+            .order_by(WeeklyReport.created_at.desc())
+            .first()
+        )
+        if prev_report and prev_report.total_time:
+            report.pre_total_time = prev_report.total_time
+        
+        # Fetch sample data for LLM analysis
+        sample_texts: List[str] = []
+        try:
+            samples = await archive_client.watch_history_analytics_samples(
+                sec_user_id=user.latest_sec_user_id,
+                range=range_spec,
+                time_zone=user.time_zone or "UTC",
+                strategy={"type": "recent"},
+                limit=50,
+                max_chars_per_item=300,
+                fields=["title", "description", "hashtags", "music", "author"],
+                include_video_id=False,
+                include_watched_at=False,
+            )
+            items = samples.get("items") if isinstance(samples, dict) else None
+            if isinstance(items, list):
+                sample_texts = [str(it.get("text") or "").strip() for it in items if isinstance(it, dict)]
+                sample_texts = [t for t in sample_texts if t]
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_user_analyze.samples_failed",
+                extra={"event": "weekly_report_user_analyze.samples_failed", "app_user_id": app_user_id, "error": str(exc)},
+            )
+        
+        # LLM analysis (only if we have sample data)
+        if sample_texts:
+            # 1. Feeding state analysis
+            try:
+                feeding_result = await _call_llm(WEEKLY_FEEDING_STATE_PROMPT, sample_texts, temperature=0.3)
+                feeding_state = feeding_result.strip().lower()
+                if feeding_state in ("curious", "excited", "cozy", "sleepy", "dizzy"):
+                    report.feeding_state = feeding_state
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.feeding_state_failed",
+                    extra={"event": "weekly_report_user_analyze.feeding_state_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
+            
+            # 2. Topics analysis
+            try:
+                topics_result = await _call_llm(WEEKLY_TOPICS_PROMPT, sample_texts, temperature=0.5)
+                topics_data = _extract_json_value(topics_result)
+                if isinstance(topics_data, list):
+                    topics = []
+                    for item in topics_data[:3]:
+                        if isinstance(item, dict) and item.get("topic"):
+                            topics.append({"topic": str(item["topic"]), "pic_url": ""})
+                        elif isinstance(item, str):
+                            topics.append({"topic": item, "pic_url": ""})
+                    if topics:
+                        report.topics = topics
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.topics_failed",
+                    extra={"event": "weekly_report_user_analyze.topics_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
+            
+            # 3. Rabbit hole analysis
+            try:
+                rabbit_result = await _call_llm(WEEKLY_RABBIT_HOLE_PROMPT, sample_texts, temperature=0.3)
+                rabbit_data = _extract_json_value(rabbit_result)
+                if isinstance(rabbit_data, dict):
+                    category = rabbit_data.get("category")
+                    count = rabbit_data.get("count")
+                    if category and isinstance(category, str):
+                        report.rabbit_hole_category = category
+                        if isinstance(count, (int, float)):
+                            report.rabbit_hole_count = int(count)
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.rabbit_hole_failed",
+                    extra={"event": "weekly_report_user_analyze.rabbit_hole_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
+            
+            # 4. Nudge text analysis
+            try:
+                nudge_result = await _call_llm(WEEKLY_NUDGE_PROMPT, sample_texts, temperature=0.7)
+                nudge_text = nudge_result.strip()
+                if nudge_text and len(nudge_text) <= 80:
+                    report.nudge_text = nudge_text
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.nudge_failed",
+                    extra={"event": "weekly_report_user_analyze.nudge_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
+        
+        # TODO: Use global_analysis for per-user comparative metrics
+        # For example: calculate user's percentile vs global average
+        # if global_analysis.get("avg_watch_hours_per_user"):
+        #     user_percentile = calculate_percentile(total_hours, global_analysis["avg_watch_hours_per_user"])
+        
+        # Call external Node.js service to generate email HTML content
+        node_url = (os.getenv("WEEKLY_REPORT_NODE_URL") or "").strip()
+        if node_url:
+            try:
+                node_params = {
+                    "period_start": _iso_utc(week_start) if week_start else None,
+                    "period_end": _iso_utc(week_end) if week_end else None,
+                    "timezone": report.timezone,
+                    "total_videos": report.total_videos,
+                    "total_time": report.total_time,
+                    "pre_total_time": report.pre_total_time,
+                    "miles_scrolled": report.miles_scrolled,
+                    "feeding_state": report.feeding_state,
+                    "topics": report.topics,
+                    "trend_name": report.trend_name,
+                    "trend_type": report.trend_type,
+                    "discovery_rank": report.discovery_rank,
+                    "total_discoverers": report.total_discoverers,
+                    "origin_niche_text": report.origin_niche_text,
+                    "spread_end_text": report.spread_end_text,
+                    "reach_start": report.reach_start,
+                    "reach_end": report.reach_end,
+                    "current_reach": report.current_reach,
+                    "rabbit_hole_datetime": _iso_utc(report.rabbit_hole_datetime) if report.rabbit_hole_datetime else None,
+                    "rabbit_hole_date": report.rabbit_hole_date,
+                    "rabbit_hole_time": report.rabbit_hole_time,
+                    "rabbit_hole_count": report.rabbit_hole_count,
+                    "rabbit_hole_category": report.rabbit_hole_category,
+                    "nudge_text": report.nudge_text,
+                }
+                node_payload = {
+                    "uid": app_user_id,
+                    "params": node_params,
+                }
+                headers = {"Content-Type": "application/json"}
+                node_token = (os.getenv("WEEKLY_REPORT_NODE_TOKEN") or "").strip()
+                if node_token:
+                    headers["Authorization"] = f"Bearer {node_token}"
+                resp = httpx.post(node_url, json=node_payload, headers=headers, timeout=30.0)
+                resp.raise_for_status()
+                with suppress(Exception):
+                    node_data = resp.json()
+                    email_html = node_data.get("html") or node_data.get("email_content")
+                    if isinstance(email_html, str) and email_html.strip():
+                        report.email_content = email_html
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.node_failed",
+                    extra={"event": "weekly_report_user_analyze.node_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
+        
+        report.analyze_status = "analyzed"
+        db.add(report)
+        db.commit()
+        
+        logger.info(
+            "weekly_report_user_analyze.completed",
+            extra={
+                "event": "weekly_report_user_analyze.completed",
+                "app_user_id": app_user_id,
+                "report_id": report.id,
+            },
+        )
+    
+    return True
+
+
+async def handle_weekly_report_batch_send(job: LeasedJob) -> bool:
+    """Coordinator job: Create send jobs for all users with analyzed reports.
+    
+    This job:
+    1. Updates global report status to 'sending'
+    2. Enqueues weekly_report_send jobs for each user with analyzed report
+    3. Updates global report status to 'completed'
+    """
+    global_report_id = job.payload.get("global_report_id")
+    if not global_report_id:
+        return True
+    
+    with SessionLocal() as db:
+        global_report = db.get(WeeklyReportGlobal, global_report_id)
+        if not global_report:
+            return True
+        
+        # Update status to sending
+        global_report.status = "sending"
+        db.add(global_report)
+        db.commit()
+        
+        # Get all user reports that were analyzed
+        user_reports = (
+            db.query(WeeklyReport)
+            .filter(
+                WeeklyReport.global_report_id == global_report_id,
+                WeeklyReport.analyze_status == "analyzed",
+            )
+            .all()
+        )
+        
+        if not user_reports:
+            logger.info(
+                "weekly_report_batch_send.no_reports",
+                extra={
+                    "event": "weekly_report_batch_send.no_reports",
+                    "global_report_id": global_report_id,
+                },
+            )
+            global_report.status = "completed"
+            db.add(global_report)
+            db.commit()
+            return True
+        
+        enqueued = 0
+        for report in user_reports:
+            # Check if user has email and is not unsubscribed
+            user = db.get(AppUser, report.app_user_id)
+            if not user or user.weekly_report_unsubscribed:
+                continue
+            
+            # Check if user has verified email
+            email = (
+                db.query(AppUserEmail)
+                .filter(AppUserEmail.app_user_id == report.app_user_id)
+                .order_by(AppUserEmail.created_at.desc())
+                .first()
+            )
+            if not email or not email.email:
+                continue
+            
+            # Enqueue send job (reuse existing weekly_report_send handler)
+            job_queue.enqueue(
+                db,
+                task_name="weekly_report_send",
+                payload={"app_user_id": report.app_user_id},
+                idempotency_key=f"weekly_report_send:{global_report_id}:{report.app_user_id}",
+            )
+            enqueued += 1
+        
+        global_report.status = "completed"
+        db.add(global_report)
+        db.commit()
+        
+        logger.info(
+            "weekly_report_batch_send.completed",
+            extra={
+                "event": "weekly_report_batch_send.completed",
+                "global_report_id": global_report_id,
+                "enqueued_sends": enqueued,
+                "total_analyzed": len(user_reports),
+            },
+        )
+    
+    return True
+
+
 async def handle_job(job: LeasedJob) -> bool:
     """Dispatch jobs by task_name. Return True on success, False on retry."""
     set_service("worker")
@@ -3761,6 +4696,19 @@ async def handle_job(job: LeasedJob) -> bool:
             return await handle_weekly_report_analyze(job)
         if job.task_name == "weekly_report_send":
             return await handle_weekly_report_send(job)
+        # Batch processing handlers
+        if job.task_name == "weekly_report_batch_fetch":
+            return await handle_weekly_report_batch_fetch(job)
+        if job.task_name == "weekly_report_user_fetch":
+            return await handle_weekly_report_user_fetch(job)
+        if job.task_name == "weekly_report_global_analyze":
+            return await handle_weekly_report_global_analyze(job)
+        if job.task_name == "weekly_report_batch_analyze":
+            return await handle_weekly_report_batch_analyze(job)
+        if job.task_name == "weekly_report_user_analyze":
+            return await handle_weekly_report_user_analyze(job)
+        if job.task_name == "weekly_report_batch_send":
+            return await handle_weekly_report_batch_send(job)
         return True
     except Exception as exc:
         logger.exception(

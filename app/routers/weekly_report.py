@@ -7,8 +7,10 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
+from datetime import timedelta
+
 from app.db import SessionLocal
-from app.models import AppUser, AppUserEmail, WeeklyReport
+from app.models import AppUser, AppUserEmail, WeeklyReport, WeeklyReportGlobal
 from app.schemas import (
     TopicItem,
     UnsubscribeRequest,
@@ -145,6 +147,24 @@ async def unsubscribe_weekly_report(
 
 
 @router.post(
+    "/weekly-report/resubscribe",
+    response_model=UnsubscribeResponse,
+    tags=["weekly-report"],
+)
+async def resubscribe_weekly_report(
+    payload: UnsubscribeRequest, db: Session = Depends(get_db)
+) -> UnsubscribeResponse:
+    user = db.get(AppUser, payload.app_user_id)
+    if user:
+        user.weekly_report_unsubscribed = False
+        user.updated_at = datetime.utcnow()
+        db.add(user)
+        db.commit()
+    # Return success even if user not found (idempotent)
+    return UnsubscribeResponse(success=True, message="Re-subscribed")
+
+
+@router.post(
     "/admin/cron/weekly-report-analyze",
     status_code=204,
     dependencies=[Depends(require_weekly_token)],
@@ -234,6 +254,161 @@ async def cron_weekly_report_send(db: Session = Depends(get_db)) -> Response:
         extra={"event": "cron.weekly_report_send.enqueued", "enqueued": enqueued, "total_users": len(users)},
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/admin/cron/weekly-report-batch",
+    status_code=200,
+    dependencies=[Depends(require_weekly_token)],
+    tags=["weekly-report", "admin"],
+    include_in_schema=False,
+)
+async def cron_weekly_report_batch(db: Session = Depends(get_db)):
+    """Trigger the batch weekly report processing flow.
+    
+    This endpoint initiates the complete batch processing pipeline:
+    1. Creates a WeeklyReportGlobal record for this week
+    2. Enqueues weekly_report_batch_fetch job which will:
+       - Fetch data for all eligible users
+       - Trigger global analysis
+       - Trigger per-user analysis
+       - Trigger email sending
+    
+    The entire flow runs asynchronously via job queue.
+    
+    Returns:
+        JSON with global_report_id and batch_fetch_job_id
+    """
+    # Calculate current week boundaries
+    now = datetime.utcnow()
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + timedelta(days=7)
+    
+    # Get or create global report for this week
+    global_report = (
+        db.query(WeeklyReportGlobal)
+        .filter(
+            WeeklyReportGlobal.period_start == week_start,
+            WeeklyReportGlobal.period_end == week_end,
+        )
+        .first()
+    )
+    
+    if not global_report:
+        global_report = WeeklyReportGlobal(
+            period_start=week_start,
+            period_end=week_end,
+            status="pending",
+        )
+        db.add(global_report)
+        db.commit()
+        db.refresh(global_report)
+    
+    # Enqueue the batch fetch job
+    batch_job = job_queue.enqueue(
+        db,
+        task_name="weekly_report_batch_fetch",
+        payload={"global_report_id": global_report.id},
+        idempotency_key=f"weekly_report_batch_fetch:{global_report.id}",
+    )
+    
+    logger.info(
+        "cron.weekly_report_batch.triggered",
+        extra={
+            "event": "cron.weekly_report_batch.triggered",
+            "global_report_id": global_report.id,
+            "batch_fetch_job_id": batch_job.id,
+            "period_start": week_start.isoformat(),
+            "period_end": week_end.isoformat(),
+        },
+    )
+    
+    return {
+        "global_report_id": global_report.id,
+        "batch_fetch_job_id": batch_job.id,
+        "period_start": week_start.isoformat() + "Z",
+        "period_end": week_end.isoformat() + "Z",
+        "status": global_report.status,
+    }
+
+
+@router.get(
+    "/admin/weekly-report-global/{global_report_id}",
+    dependencies=[Depends(require_weekly_token)],
+    tags=["weekly-report", "admin"],
+    include_in_schema=False,
+)
+async def get_global_report_status(global_report_id: int, db: Session = Depends(get_db)):
+    """Get the status of a global weekly report batch job.
+    
+    Returns:
+        JSON with global report status and statistics
+    """
+    global_report = db.get(WeeklyReportGlobal, global_report_id)
+    if not global_report:
+        raise HTTPException(status_code=404, detail="not_found")
+    
+    # Count user reports by status
+    fetch_pending = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.fetch_status == "pending",
+    ).count()
+    fetch_fetching = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.fetch_status == "fetching",
+    ).count()
+    fetch_fetched = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.fetch_status == "fetched",
+    ).count()
+    fetch_failed = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.fetch_status == "failed",
+    ).count()
+    
+    analyze_pending = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.analyze_status == "pending",
+    ).count()
+    analyze_analyzing = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.analyze_status == "analyzing",
+    ).count()
+    analyze_analyzed = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.analyze_status == "analyzed",
+    ).count()
+    analyze_failed = db.query(WeeklyReport).filter(
+        WeeklyReport.global_report_id == global_report_id,
+        WeeklyReport.analyze_status == "failed",
+    ).count()
+    
+    return {
+        "id": global_report.id,
+        "period_start": global_report.period_start.isoformat() + "Z" if global_report.period_start else None,
+        "period_end": global_report.period_end.isoformat() + "Z" if global_report.period_end else None,
+        "status": global_report.status,
+        "total_users": global_report.total_users,
+        "total_videos": global_report.total_videos,
+        "total_watch_hours": global_report.total_watch_hours,
+        "analysis_result": global_report.analysis_result,
+        "created_at": global_report.created_at.isoformat() + "Z" if global_report.created_at else None,
+        "updated_at": global_report.updated_at.isoformat() + "Z" if global_report.updated_at else None,
+        "user_reports": {
+            "fetch": {
+                "pending": fetch_pending,
+                "fetching": fetch_fetching,
+                "fetched": fetch_fetched,
+                "failed": fetch_failed,
+            },
+            "analyze": {
+                "pending": analyze_pending,
+                "analyzing": analyze_analyzing,
+                "analyzed": analyze_analyzed,
+                "failed": analyze_failed,
+            },
+        },
+    }
 
 
 @router.post(
