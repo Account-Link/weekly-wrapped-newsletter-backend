@@ -8,7 +8,7 @@ services:
       [
         "sh",
         "-lc",
-        'uv run alembic upgrade head && uv run gunicorn -c gunicorn_conf.py "app.main:app"',
+        'uv run gunicorn -c gunicorn_conf.py "app.main:app"',
       ]
     env_file: .env
     ports:
