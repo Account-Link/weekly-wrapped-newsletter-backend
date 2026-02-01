@@ -1,7 +1,10 @@
 from datetime import datetime
+from typing import Optional
+import uuid
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, JSON, String, Text
 from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
 
@@ -186,7 +189,7 @@ class WeeklyReport(Base):
     rabbit_hole_category = Column(String, nullable=True)
     nudge_text = Column(String, nullable=True)
 
-class OutfitCatalog(Base, BaseModel):
+class OutfitCatalog(Base):
     __tablename__ = "f_outfit_catalog"
 
     id: Mapped[str] = mapped_column(
@@ -211,6 +214,10 @@ class OutfitCatalog(Base, BaseModel):
 
     is_stackable: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     appraised_state: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    """Base model mixin with common timestamp fields"""
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Future: CDN image URL
     pic: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
