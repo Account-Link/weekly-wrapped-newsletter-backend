@@ -19,4 +19,6 @@ htmlcov/
 .vscode/
 *.db
 alembic/versions/__pycache__/
-scripts/
+# TikTok Creative Radar refresh script output / session (do not commit)
+.env.radar
+radar_session/

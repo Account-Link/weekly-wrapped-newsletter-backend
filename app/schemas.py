@@ -567,6 +567,7 @@ class UploadResponse(BaseModel):
 class WeeklyReportTestRequest(BaseModel):
     send_email: bool = False  # Whether to send the email after generating the report (default: False for safety)
     email: Optional[EmailStr] = None  # Override email address (for testing, instead of user's email)
+    use_batch_flow: bool = False  # If True, trigger full pipeline: fetch_trends -> user_fetch -> analyze -> send (single user)
 
 
 class WeeklyReportTestResponse(BaseModel):
@@ -577,3 +578,5 @@ class WeeklyReportTestResponse(BaseModel):
     email_sent: bool
     email_address: Optional[str] = None
     report: WeeklyReportResponse
+    use_batch_flow: bool = False  # True when full pipeline (fetch_trends -> ... -> send) was triggered
+    fetch_trends_job_id: Optional[str] = None  # Set when use_batch_flow=True

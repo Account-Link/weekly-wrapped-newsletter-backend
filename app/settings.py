@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     s3_url: Optional[str] = Field(None, alias="S3_URL")  # Base URL for public links (e.g. CloudFront)
     aws_region: Optional[str] = Field(None, alias="AWS_REGION")
 
+    # TikTok Ads Creative Radar (session-based; cookies/signatures may need manual refresh)
+    tiktok_ads_cookie: Optional[str] = Field(None, alias="TIKTOK_ADS_COOKIE")
+    tiktok_ads_user_sign: Optional[str] = Field(None, alias="TIKTOK_ADS_USER_SIGN")
+    tiktok_ads_web_id: Optional[str] = Field(None, alias="TIKTOK_ADS_WEB_ID")
+    tiktok_ads_country_code: str = Field("US", alias="TIKTOK_ADS_COUNTRY_CODE")
+    # If set, worker will try to capture headers from browser on each fetch_trends (requires Playwright + Chromium and state.json from scripts/refresh_tiktok_creative_radar_headers.py --persist)
+    tiktok_ads_session_dir: Optional[str] = Field(None, alias="TIKTOK_ADS_SESSION_DIR")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

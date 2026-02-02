@@ -19,7 +19,22 @@ from sqlalchemy import func
 from app import accessories
 from app.db import SessionLocal
 from app.emailer import Emailer
-from app.models import AppAuthJob, AppJob, AppSession, AppUser, AppUserEmail, AppWrappedRun, DeviceEmail, Referral, ReferralEvent, WeeklyReport, WeeklyReportGlobal
+from app.models import (
+    AppAuthJob,
+    AppJob,
+    AppSession,
+    AppUser,
+    AppUserEmail,
+    AppWrappedRun,
+    DeviceEmail,
+    Referral,
+    ReferralEvent,
+    WeeklyReport,
+    WeeklyReportGlobal,
+    WeeklyTrendCreator,
+    WeeklyTrendHashtag,
+    WeeklyTrendSound,
+)
 from app.observability import bind_context, clear_context, get_logger, sanitize_json_text, set_service, setup_logging
 from app.prompts import (
     ACCESSORY_SET_PROMPT,
@@ -41,6 +56,8 @@ from app.prompts import (
 from app.services.archive_client import ArchiveClient
 from app.services.job_queue import DBJobQueue
 from app.services.session_service import SessionService
+from app.services.tiktok_creative_radar_capture import capture_headers as capture_tiktok_radar_headers
+from app.services.tiktok_creative_radar_client import TikTokCreativeRadarClient, TikTokCreativeRadarError
 from app.settings import get_settings
 
 job_queue = DBJobQueue()
@@ -3724,6 +3741,15 @@ async def handle_weekly_report_send(job: LeasedJob) -> bool:
 # ============================================================================
 
 
+def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Return dt as timezone-aware UTC; if naive, assume UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _get_week_boundaries() -> tuple[datetime, datetime]:
     """Get the start and end of the current week (Monday 00:00 UTC to next Monday 00:00 UTC)."""
     now = datetime.now(timezone.utc)
@@ -3754,29 +3780,219 @@ def _get_or_create_global_report(db, week_start: datetime, week_end: datetime) -
     return global_report
 
 
+async def handle_weekly_report_fetch_trends(job: LeasedJob) -> bool:
+    """Fetch TikTok Creative Radar top 100 (hashtag/sound/creator), persist, then enqueue batch_fetch.
+    
+    If TikTok Ads credentials are missing or API fails, we still enqueue weekly_report_batch_fetch
+    so the rest of the pipeline runs without trend data.
+    """
+    global_report_id = job.payload.get("global_report_id")
+    if not global_report_id:
+        return True
+
+    with SessionLocal() as db:
+        global_report = db.get(WeeklyReportGlobal, global_report_id)
+        if not global_report:
+            return True
+
+    cookie: Optional[str] = None
+    user_sign: Optional[str] = None
+    web_id: Optional[str] = None
+    headers_from_capture = False
+
+    # In-process capture: if SESSION_DIR is set, get headers via Playwright *here* before calling the API (no separate script run per fetch)
+    session_dir = getattr(settings, "tiktok_ads_session_dir", None) or os.getenv("TIKTOK_ADS_SESSION_DIR")
+    if session_dir and session_dir.strip():
+        session_dir = session_dir.strip()
+        try:
+            captured = await capture_tiktok_radar_headers(session_dir)
+            if captured:
+                cookie, user_sign, web_id = captured
+                headers_from_capture = True
+                logger.info(
+                    "weekly_report_fetch_trends.headers_captured",
+                    extra={"event": "weekly_report_fetch_trends.headers_captured", "global_report_id": global_report_id},
+                )
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_fetch_trends.capture_failed",
+                extra={"event": "weekly_report_fetch_trends.capture_failed", "global_report_id": global_report_id, "error": str(exc)},
+            )
+
+    if not (cookie and user_sign and web_id):
+        cookie = getattr(settings, "tiktok_ads_cookie", None) or os.getenv("TIKTOK_ADS_COOKIE")
+        user_sign = getattr(settings, "tiktok_ads_user_sign", None) or os.getenv("TIKTOK_ADS_USER_SIGN")
+        web_id = getattr(settings, "tiktok_ads_web_id", None) or os.getenv("TIKTOK_ADS_WEB_ID")
+    country_code = getattr(settings, "tiktok_ads_country_code", "US") or "US"
+
+    headers_source = "captured" if headers_from_capture else ("env" if (cookie or user_sign or web_id) else "anonymous")
+    logger.info(
+        "weekly_report_fetch_trends.headers_source",
+        extra={
+            "event": "weekly_report_fetch_trends.headers_source",
+            "global_report_id": global_report_id,
+            "headers_source": headers_source,
+            "session_dir_configured": bool(session_dir and str(session_dir).strip()),
+        },
+    )
+
+    # Client uses built-in anonymous headers when cookie/user_sign/web_id are not set (no login required)
+    client = TikTokCreativeRadarClient(
+        cookie=cookie or None,
+        user_sign=user_sign or None,
+        web_id=web_id or None,
+        country_code=country_code,
+    )
+    try:
+        creators = await client.fetch_all_creators()
+        sounds = await client.fetch_all_sounds()
+        hashtags = await client.fetch_all_hashtags()
+    except TikTokCreativeRadarError as exc:
+        resp = getattr(exc, "response", None) or {}
+        logger.warning(
+            "weekly_report_fetch_trends.api_error",
+                extra={
+                    "event": "weekly_report_fetch_trends.api_error",
+                    "global_report_id": global_report_id,
+                    "error": str(exc),
+                    "code": getattr(exc, "code", None),
+                    "api_msg": resp.get("msg") if isinstance(resp, dict) else None,
+                },
+        )
+        creators, sounds, hashtags = [], [], []
+    except Exception as exc:
+        logger.warning(
+            "weekly_report_fetch_trends.fetch_failed",
+            extra={
+                "event": "weekly_report_fetch_trends.fetch_failed",
+                "global_report_id": global_report_id,
+                "error": str(exc),
+            },
+        )
+        creators, sounds, hashtags = [], [], []
+    finally:
+        await client.close()
+
+    with SessionLocal() as db:
+        # Idempotent: delete existing trend rows for this week, then insert
+        db.query(WeeklyTrendHashtag).filter(WeeklyTrendHashtag.global_report_id == global_report_id).delete()
+        db.query(WeeklyTrendSound).filter(WeeklyTrendSound.global_report_id == global_report_id).delete()
+        db.query(WeeklyTrendCreator).filter(WeeklyTrendCreator.global_report_id == global_report_id).delete()
+
+        for rank, h in enumerate(hashtags, start=1):
+            country_info = h.get("country_info") or {}
+            country_code_val = country_info.get("id") if isinstance(country_info, dict) else h.get("country_code")
+            row = WeeklyTrendHashtag(
+                global_report_id=global_report_id,
+                rank=rank,
+                hashtag_id=str(h.get("hashtag_id") or ""),
+                hashtag_name=h.get("hashtag_name"),
+                country_code=country_code_val or h.get("country_code"),
+                publish_cnt=int(h.get("publish_cnt") or 0) if h.get("publish_cnt") is not None else None,
+                video_views=int(h.get("video_views") or 0) if h.get("video_views") is not None else None,
+                rank_diff=int(h.get("rank_diff")) if h.get("rank_diff") is not None else None,
+                rank_diff_type=int(h.get("rank_diff_type")) if h.get("rank_diff_type") is not None else None,
+                trend=h.get("trend"),
+                industry_info=h.get("industry_info"),
+            )
+            db.add(row)
+
+        for rank, s in enumerate(sounds, start=1):
+            row = WeeklyTrendSound(
+                global_report_id=global_report_id,
+                rank=rank,
+                clip_id=str(s.get("clip_id") or ""),
+                song_id=str(s.get("song_id") or ""),
+                title=s.get("title"),
+                author=s.get("author"),
+                country_code=s.get("country_code"),
+                duration=int(s.get("duration")) if s.get("duration") is not None else None,
+                link=s.get("link"),
+                trend=s.get("trend"),
+            )
+            db.add(row)
+
+        for rank, c in enumerate(creators, start=1):
+            row = WeeklyTrendCreator(
+                global_report_id=global_report_id,
+                rank=rank,
+                tcm_id=str(c.get("tcm_id") or ""),
+                user_id=str(c.get("user_id") or ""),
+                nick_name=c.get("nick_name"),
+                avatar_url=c.get("avatar_url"),
+                country_code=c.get("country_code"),
+                follower_cnt=int(c.get("follower_cnt")) if c.get("follower_cnt") is not None else None,
+                liked_cnt=int(c.get("liked_cnt")) if c.get("liked_cnt") is not None else None,
+                tt_link=c.get("tt_link"),
+                items=c.get("items"),
+            )
+            db.add(row)
+
+        db.commit()
+        logger.info(
+            "weekly_report_fetch_trends.saved",
+            extra={
+                "event": "weekly_report_fetch_trends.saved",
+                "global_report_id": global_report_id,
+                "hashtags": len(hashtags),
+                "sounds": len(sounds),
+                "creators": len(creators),
+            },
+        )
+
+        batch_payload: Dict[str, Any] = {"global_report_id": global_report_id}
+        limit_to = job.payload.get("limit_to_app_user_ids")
+        if isinstance(limit_to, list) and limit_to:
+            batch_payload["limit_to_app_user_ids"] = [str(u) for u in limit_to]
+        email_override = job.payload.get("email_override")
+        if isinstance(email_override, str) and email_override.strip():
+            batch_payload["email_override"] = email_override.strip()
+        job_queue.enqueue(
+            db,
+            task_name="weekly_report_batch_fetch",
+            payload=batch_payload,
+            idempotency_key=f"weekly_report_batch_fetch:{global_report_id}",
+        )
+    return True
+
+
 async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
     """Coordinator job: Create fetch jobs for all eligible users, then trigger global analysis.
     
-    This job:
-    1. Creates a WeeklyReportGlobal record for this week
-    2. Creates WeeklyReport records for each eligible user
-    3. Enqueues weekly_report_user_fetch jobs for each user
-    4. Polls until all fetch jobs are complete
-    5. Enqueues weekly_report_global_analyze job
+    When payload contains global_report_id, uses that existing WeeklyReportGlobal (from fetch_trends).
+    Otherwise gets or creates global report for this week.
+    Then creates WeeklyReport records, enqueues weekly_report_user_fetch, polls, enqueues global_analyze.
     """
-    week_start, week_end = _get_week_boundaries()
-    
+    payload = job.payload or {}
+    global_report_id_from_payload = payload.get("global_report_id")
+    limit_to_app_user_ids: Optional[List[str]] = payload.get("limit_to_app_user_ids")
+    if isinstance(limit_to_app_user_ids, list):
+        limit_to_app_user_ids = [str(u) for u in limit_to_app_user_ids if u]
+    else:
+        limit_to_app_user_ids = None
+    email_override = payload.get("email_override") if isinstance(payload.get("email_override"), str) else None
+    if email_override:
+        email_override = email_override.strip() or None
+
     with SessionLocal() as db:
-        # Get or create global report
-        global_report = _get_or_create_global_report(db, week_start, week_end)
-        global_report_id = global_report.id
-        
+        if global_report_id_from_payload is not None:
+            global_report = db.get(WeeklyReportGlobal, global_report_id_from_payload)
+            if not global_report:
+                return True
+            week_start = global_report.period_start
+            week_end = global_report.period_end
+            global_report_id = global_report.id
+        else:
+            week_start, week_end = _get_week_boundaries()
+            global_report = _get_or_create_global_report(db, week_start, week_end)
+            global_report_id = global_report.id
+
         # Update status to fetching
         global_report.status = "fetching"
         db.add(global_report)
         db.commit()
-        
-        # Query eligible users
+
+        # Query eligible users (optionally limited to a subset for single-user test)
         users = (
             db.query(AppUser)
             .filter(
@@ -3786,7 +4002,10 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
             )
             .all()
         )
-        
+        if limit_to_app_user_ids:
+            allowed = set(limit_to_app_user_ids)
+            users = [u for u in users if u.app_user_id in allowed]
+
         if not users:
             logger.info(
                 "weekly_report_batch_fetch.no_users",
@@ -3797,9 +4016,8 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
             db.add(global_report)
             db.commit()
             return True
-        
+
         # Create/update WeeklyReport records and enqueue fetch jobs
-        user_report_ids = []
         for user in users:
             # Check for existing report this week
             existing_report = (
@@ -3810,7 +4028,7 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
                 )
                 .first()
             )
-            
+
             if existing_report:
                 report = existing_report
             else:
@@ -3836,13 +4054,12 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
                         fetch_status="pending",
                         analyze_status="pending",
                     )
-            
+
             report.fetch_status = "pending"
             db.add(report)
             db.commit()
             db.refresh(report)
-            user_report_ids.append((user.app_user_id, report.id))
-            
+
             # Enqueue fetch job
             job_queue.enqueue(
                 db,
@@ -3854,11 +4071,11 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
                 },
                 idempotency_key=f"weekly_report_user_fetch:{global_report_id}:{user.app_user_id}",
             )
-        
+
         global_report.total_users = len(users)
         db.add(global_report)
         db.commit()
-        
+
         logger.info(
             "weekly_report_batch_fetch.enqueued",
             extra={
@@ -3867,7 +4084,7 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
                 "total_users": len(users),
             },
         )
-    
+
     # Poll until all fetch jobs complete
     max_wait_seconds = float(os.getenv("WEEKLY_REPORT_BATCH_FETCH_MAX_WAIT_SECONDS", "3600"))
     poll_interval = float(os.getenv("WEEKLY_REPORT_BATCH_POLL_INTERVAL_SECONDS", "10"))
@@ -3895,12 +4112,15 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
                         "global_report_id": global_report_id,
                     },
                 )
-                
-                # Enqueue global analyze job
+                global_analyze_payload: Dict[str, Any] = {"global_report_id": global_report_id}
+                if limit_to_app_user_ids is not None:
+                    global_analyze_payload["limit_to_app_user_ids"] = limit_to_app_user_ids
+                if email_override:
+                    global_analyze_payload["email_override"] = email_override
                 job_queue.enqueue(
                     db,
                     task_name="weekly_report_global_analyze",
-                    payload={"global_report_id": global_report_id},
+                    payload=global_analyze_payload,
                     idempotency_key=f"weekly_report_global_analyze:{global_report_id}",
                 )
                 return True
@@ -3916,10 +4136,15 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
     )
     
     with SessionLocal() as db:
+        global_analyze_payload_timeout: Dict[str, Any] = {"global_report_id": global_report_id}
+        if limit_to_app_user_ids is not None:
+            global_analyze_payload_timeout["limit_to_app_user_ids"] = limit_to_app_user_ids
+        if email_override:
+            global_analyze_payload_timeout["email_override"] = email_override
         job_queue.enqueue(
             db,
             task_name="weekly_report_global_analyze",
-            payload={"global_report_id": global_report_id},
+            payload=global_analyze_payload_timeout,
             idempotency_key=f"weekly_report_global_analyze:{global_report_id}",
         )
     
@@ -3959,8 +4184,8 @@ async def handle_weekly_report_user_fetch(job: LeasedJob) -> bool:
         db.add(report)
         db.commit()
         
-        week_start = report.period_start
-        week_end = report.period_end
+        week_start = _ensure_utc(report.period_start)
+        week_end = _ensure_utc(report.period_end)
         if not week_start or not week_end:
             week_start, week_end = _get_week_boundaries()
             report.period_start = week_start
@@ -4084,10 +4309,15 @@ async def handle_weekly_report_global_analyze(job: LeasedJob) -> bool:
     3. Saves results to WeeklyReportGlobal.analysis_result
     4. Triggers weekly_report_batch_analyze job
     """
-    global_report_id = job.payload.get("global_report_id")
+    payload = job.payload or {}
+    global_report_id = payload.get("global_report_id")
     if not global_report_id:
         return True
-    
+    limit_to_app_user_ids = payload.get("limit_to_app_user_ids")
+    email_override = payload.get("email_override") if isinstance(payload.get("email_override"), str) else None
+    if email_override:
+        email_override = email_override.strip() or None
+
     with SessionLocal() as db:
         global_report = db.get(WeeklyReportGlobal, global_report_id)
         if not global_report:
@@ -4155,11 +4385,15 @@ async def handle_weekly_report_global_analyze(job: LeasedJob) -> bool:
             },
         )
         
-        # Enqueue batch analyze job
+        batch_analyze_payload: Dict[str, Any] = {"global_report_id": global_report_id}
+        if limit_to_app_user_ids is not None:
+            batch_analyze_payload["limit_to_app_user_ids"] = limit_to_app_user_ids
+        if email_override:
+            batch_analyze_payload["email_override"] = email_override
         job_queue.enqueue(
             db,
             task_name="weekly_report_batch_analyze",
-            payload={"global_report_id": global_report_id},
+            payload=batch_analyze_payload,
             idempotency_key=f"weekly_report_batch_analyze:{global_report_id}",
         )
     
@@ -4174,10 +4408,15 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
     2. Polls until all analyze jobs are complete
     3. Enqueues weekly_report_batch_send job
     """
-    global_report_id = job.payload.get("global_report_id")
+    payload = job.payload or {}
+    global_report_id = payload.get("global_report_id")
     if not global_report_id:
         return True
-    
+    limit_to_app_user_ids = payload.get("limit_to_app_user_ids")
+    email_override = payload.get("email_override") if isinstance(payload.get("email_override"), str) else None
+    if email_override:
+        email_override = email_override.strip() or None
+
     with SessionLocal() as db:
         global_report = db.get(WeeklyReportGlobal, global_report_id)
         if not global_report:
@@ -4261,11 +4500,15 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
                     },
                 )
                 
-                # Enqueue batch send job
+                batch_send_payload: Dict[str, Any] = {"global_report_id": global_report_id}
+                if limit_to_app_user_ids is not None:
+                    batch_send_payload["limit_to_app_user_ids"] = limit_to_app_user_ids
+                if email_override:
+                    batch_send_payload["email_override"] = email_override
                 job_queue.enqueue(
                     db,
                     task_name="weekly_report_batch_send",
-                    payload={"global_report_id": global_report_id},
+                    payload=batch_send_payload,
                     idempotency_key=f"weekly_report_batch_send:{global_report_id}",
                 )
                 return True
@@ -4281,10 +4524,15 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
     )
     
     with SessionLocal() as db:
+        batch_send_payload_timeout: Dict[str, Any] = {"global_report_id": global_report_id}
+        if limit_to_app_user_ids is not None:
+            batch_send_payload_timeout["limit_to_app_user_ids"] = limit_to_app_user_ids
+        if email_override:
+            batch_send_payload_timeout["email_override"] = email_override
         job_queue.enqueue(
             db,
             task_name="weekly_report_batch_send",
-            payload={"global_report_id": global_report_id},
+            payload=batch_send_payload_timeout,
             idempotency_key=f"weekly_report_batch_send:{global_report_id}",
         )
     
@@ -4333,8 +4581,8 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
             if global_report and global_report.analysis_result:
                 global_analysis = global_report.analysis_result
         
-        week_start = report.period_start
-        week_end = report.period_end
+        week_start = _ensure_utc(report.period_start)
+        week_end = _ensure_utc(report.period_end)
         if not week_start or not week_end:
             week_start, week_end = _get_week_boundaries()
             report.period_start = week_start
@@ -4401,7 +4649,65 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
         )
         if prev_report and prev_report.total_time:
             report.pre_total_time = prev_report.total_time
-        
+
+        # Use weekly trends for discovery_rank / trend_name / trend_type
+        if global_report_id:
+            top_creators = summary.get("top_creators") or []
+            top_music_items = summary.get("top_music") or []
+            creator_trends = (
+                db.query(WeeklyTrendCreator)
+                .filter(WeeklyTrendCreator.global_report_id == global_report_id)
+                .order_by(WeeklyTrendCreator.rank)
+                .all()
+            )
+            sound_trends = (
+                db.query(WeeklyTrendSound)
+                .filter(WeeklyTrendSound.global_report_id == global_report_id)
+                .order_by(WeeklyTrendSound.rank)
+                .all()
+            )
+
+            def _norm(s: Optional[str]) -> str:
+                return (s or "").strip().lower()
+
+            best_rank: Optional[int] = None
+            best_type: Optional[str] = None
+            best_name: Optional[str] = None
+
+            for c in top_creators:
+                if not isinstance(c, dict):
+                    continue
+                author_id = str(c.get("author_id") or "")
+                if not author_id:
+                    continue
+                for t in creator_trends:
+                    if t.user_id and t.user_id == author_id:
+                        if best_rank is None or t.rank < best_rank:
+                            best_rank = t.rank
+                            best_type = "creator"
+                            best_name = t.nick_name or ""
+                        break
+
+            for m in top_music_items:
+                if not isinstance(m, dict):
+                    continue
+                music_name = _norm(m.get("music"))
+                if not music_name:
+                    continue
+                for t in sound_trends:
+                    if t.title and _norm(t.title) == music_name:
+                        if best_rank is None or t.rank < best_rank:
+                            best_rank = t.rank
+                            best_type = "song"
+                            best_name = t.title or ""
+                        break
+
+            if best_rank is not None:
+                report.discovery_rank = best_rank
+                report.total_discoverers = 100
+                report.trend_type = best_type
+                report.trend_name = best_name
+
         # Fetch sample data for LLM analysis
         sample_texts: List[str] = []
         try:
@@ -4568,10 +4874,19 @@ async def handle_weekly_report_batch_send(job: LeasedJob) -> bool:
     2. Enqueues weekly_report_send jobs for each user with analyzed report
     3. Updates global report status to 'completed'
     """
-    global_report_id = job.payload.get("global_report_id")
+    payload = job.payload or {}
+    global_report_id = payload.get("global_report_id")
     if not global_report_id:
         return True
-    
+    limit_to_app_user_ids = payload.get("limit_to_app_user_ids")
+    if isinstance(limit_to_app_user_ids, list):
+        limit_to_app_user_ids = [str(u) for u in limit_to_app_user_ids if u]
+    else:
+        limit_to_app_user_ids = None
+    email_override = payload.get("email_override") if isinstance(payload.get("email_override"), str) else None
+    if email_override:
+        email_override = email_override.strip() or None
+
     with SessionLocal() as db:
         global_report = db.get(WeeklyReportGlobal, global_report_id)
         if not global_report:
@@ -4606,27 +4921,35 @@ async def handle_weekly_report_batch_send(job: LeasedJob) -> bool:
             return True
         
         enqueued = 0
+        test_override = limit_to_app_user_ids and email_override
+        # When single-user test with send_email=False: limit_to_app_user_ids is set but email_override is not → do not send to those users
+        limit_users_no_send = set(limit_to_app_user_ids or []) if (limit_to_app_user_ids and not email_override) else set()
         for report in user_reports:
-            # Check if user has email and is not unsubscribed
+            if report.app_user_id in limit_users_no_send:
+                continue
             user = db.get(AppUser, report.app_user_id)
-            if not user or user.weekly_report_unsubscribed:
+            if not user:
                 continue
-            
-            # Check if user has verified email
-            email = (
-                db.query(AppUserEmail)
-                .filter(AppUserEmail.app_user_id == report.app_user_id)
-                .order_by(AppUserEmail.created_at.desc())
-                .first()
-            )
-            if not email or not email.email:
+            if not test_override and user.weekly_report_unsubscribed:
                 continue
-            
-            # Enqueue send job (reuse existing weekly_report_send handler)
+
+            send_payload: Dict[str, Any] = {"app_user_id": report.app_user_id}
+            if test_override and report.app_user_id in (limit_to_app_user_ids or []):
+                send_payload["email_override"] = email_override
+            else:
+                email = (
+                    db.query(AppUserEmail)
+                    .filter(AppUserEmail.app_user_id == report.app_user_id)
+                    .order_by(AppUserEmail.created_at.desc())
+                    .first()
+                )
+                if not email or not email.email:
+                    continue
+
             job_queue.enqueue(
                 db,
                 task_name="weekly_report_send",
-                payload={"app_user_id": report.app_user_id},
+                payload=send_payload,
                 idempotency_key=f"weekly_report_send:{global_report_id}:{report.app_user_id}",
             )
             enqueued += 1
@@ -4697,6 +5020,8 @@ async def handle_job(job: LeasedJob) -> bool:
         if job.task_name == "weekly_report_send":
             return await handle_weekly_report_send(job)
         # Batch processing handlers
+        if job.task_name == "weekly_report_fetch_trends":
+            return await handle_weekly_report_fetch_trends(job)
         if job.task_name == "weekly_report_batch_fetch":
             return await handle_weekly_report_batch_fetch(job)
         if job.task_name == "weekly_report_user_fetch":

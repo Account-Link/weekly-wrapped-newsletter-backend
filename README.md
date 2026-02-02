@@ -22,6 +22,7 @@ Backend for the Weekly Wrapped Newsletter app. Uses FastAPI, SQLAlchemy + Alembi
 - 📄 **[Nginx 配置示例](./nginx.conf.example)** - 反向代理配置模板
 - ⚙️ **[环境变量模板](./.env.template)** - 详细的环境变量说明
 - 🚀 **[部署脚本](./deploy.sh)** - 交互式部署工具
+- 📊 **[TikTok Creative Radar](./docs/tiktok-creative-radar.md)** - 周报趋势拉取（no permission 时如何刷新；半自动抓 header 脚本 + 定时任务配合）
 
 > 💡 **首次使用？** 建议按顺序阅读：项目概览 → 快速开始 → 部署检查清单
 

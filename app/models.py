@@ -189,6 +189,66 @@ class WeeklyReport(Base):
     rabbit_hole_category = Column(String, nullable=True)
     nudge_text = Column(String, nullable=True)
 
+
+class WeeklyTrendHashtag(Base):
+    """Weekly top 100 hashtags from TikTok Creative Radar for a given global report."""
+    __tablename__ = "weekly_trend_hashtag"
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    global_report_id = Column(Integer, nullable=False, index=True)
+    rank = Column(Integer, nullable=False)
+    hashtag_id = Column(String, nullable=True)
+    hashtag_name = Column(String, nullable=True)
+    country_code = Column(String, nullable=True)
+    publish_cnt = Column(Integer, nullable=True)
+    video_views = Column(Integer, nullable=True)
+    rank_diff = Column(Integer, nullable=True)
+    rank_diff_type = Column(Integer, nullable=True)
+    trend = Column(JSON, nullable=True)
+    industry_info = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_weekly_trend_hashtag_global_rank", "global_report_id", "rank"),)
+
+
+class WeeklyTrendSound(Base):
+    """Weekly top 100 sounds from TikTok Creative Radar for a given global report."""
+    __tablename__ = "weekly_trend_sound"
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    global_report_id = Column(Integer, nullable=False, index=True)
+    rank = Column(Integer, nullable=False)
+    clip_id = Column(String, nullable=True)
+    song_id = Column(String, nullable=True)
+    title = Column(String, nullable=True)
+    author = Column(String, nullable=True)
+    country_code = Column(String, nullable=True)
+    duration = Column(Integer, nullable=True)
+    link = Column(String, nullable=True)
+    trend = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_weekly_trend_sound_global_rank", "global_report_id", "rank"),)
+
+
+class WeeklyTrendCreator(Base):
+    """Weekly top 100 creators from TikTok Creative Radar for a given global report."""
+    __tablename__ = "weekly_trend_creator"
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    global_report_id = Column(Integer, nullable=False, index=True)
+    rank = Column(Integer, nullable=False)
+    tcm_id = Column(String, nullable=True)
+    user_id = Column(String, nullable=True, index=True)
+    nick_name = Column(String, nullable=True)
+    avatar_url = Column(String, nullable=True)
+    country_code = Column(String, nullable=True)
+    follower_cnt = Column(Integer, nullable=True)
+    liked_cnt = Column(Integer, nullable=True)
+    tt_link = Column(String, nullable=True)
+    items = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_weekly_trend_creator_global_rank", "global_report_id", "rank"),)
+
+
 class OutfitCatalog(Base):
     __tablename__ = "f_outfit_catalog"
 

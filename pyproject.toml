@@ -30,6 +30,10 @@ dev = [
     "mypy>=1.10.0",
     "types-python-dateutil",
 ]
+# For semi-automated TikTok Creative Radar header refresh (scripts/refresh_tiktok_creative_radar_headers.py)
+tiktok-radar-refresh = [
+    "playwright>=1.40.0",
+]
 
 [tool.uv]
 exclude-newer = "2024-12-01T00:00:00Z"

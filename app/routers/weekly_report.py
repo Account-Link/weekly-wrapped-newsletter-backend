@@ -268,22 +268,21 @@ async def cron_weekly_report_batch(db: Session = Depends(get_db)):
     
     This endpoint initiates the complete batch processing pipeline:
     1. Creates a WeeklyReportGlobal record for this week
-    2. Enqueues weekly_report_batch_fetch job which will:
-       - Fetch data for all eligible users
-       - Trigger global analysis
-       - Trigger per-user analysis
-       - Trigger email sending
+    2. Enqueues weekly_report_fetch_trends job which will:
+       - Fetch TikTok Creative Radar top 100 (hashtag/sound/creator) and persist
+       - Enqueue weekly_report_batch_fetch to fetch user data, then global analyze,
+         per-user analyze, and email sending
     
     The entire flow runs asynchronously via job queue.
     
     Returns:
-        JSON with global_report_id and batch_fetch_job_id
+        JSON with global_report_id and fetch_trends_job_id
     """
     # Calculate current week boundaries
     now = datetime.utcnow()
     week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     week_end = week_start + timedelta(days=7)
-    
+
     # Get or create global report for this week
     global_report = (
         db.query(WeeklyReportGlobal)
@@ -293,7 +292,7 @@ async def cron_weekly_report_batch(db: Session = Depends(get_db)):
         )
         .first()
     )
-    
+
     if not global_report:
         global_report = WeeklyReportGlobal(
             period_start=week_start,
@@ -303,29 +302,29 @@ async def cron_weekly_report_batch(db: Session = Depends(get_db)):
         db.add(global_report)
         db.commit()
         db.refresh(global_report)
-    
-    # Enqueue the batch fetch job
-    batch_job = job_queue.enqueue(
+
+    # Enqueue fetch_trends first; it will then enqueue batch_fetch
+    fetch_trends_job = job_queue.enqueue(
         db,
-        task_name="weekly_report_batch_fetch",
+        task_name="weekly_report_fetch_trends",
         payload={"global_report_id": global_report.id},
-        idempotency_key=f"weekly_report_batch_fetch:{global_report.id}",
+        idempotency_key=f"weekly_report_fetch_trends:{global_report.id}",
     )
-    
+
     logger.info(
         "cron.weekly_report_batch.triggered",
         extra={
             "event": "cron.weekly_report_batch.triggered",
             "global_report_id": global_report.id,
-            "batch_fetch_job_id": batch_job.id,
+            "fetch_trends_job_id": fetch_trends_job.id,
             "period_start": week_start.isoformat(),
             "period_end": week_end.isoformat(),
         },
     )
-    
+
     return {
         "global_report_id": global_report.id,
-        "batch_fetch_job_id": batch_job.id,
+        "fetch_trends_job_id": fetch_trends_job.id,
         "period_start": week_start.isoformat() + "Z",
         "period_end": week_end.isoformat() + "Z",
         "status": global_report.status,
@@ -422,86 +421,126 @@ async def admin_test_weekly_report(
     payload: WeeklyReportTestRequest,
     db: Session = Depends(get_db),
 ) -> WeeklyReportTestResponse:
-    """Test endpoint to run the complete weekly report flow for a single user.
+    """Test endpoint to run the weekly report flow for a single user.
     
-    This endpoint:
+    When use_batch_flow=False (default):
     1. Validates the user exists and has sec_user_id
-    2. Enqueues the weekly_report_analyze job
-    3. If send_email is True, also enqueues the weekly_report_send job
-    4. Returns the job information
+    2. Enqueues weekly_report_analyze (legacy single-job path)
+    3. If send_email is True, also enqueues weekly_report_send
+    
+    When use_batch_flow=True (full pipeline):
+    1. Validates the user exists and has sec_user_id
+    2. Creates/gets WeeklyReportGlobal for this week
+    3. Enqueues weekly_report_fetch_trends with limit_to_app_user_ids=[app_user_id]
+    4. Pipeline runs: fetch trends -> user_fetch -> global_analyze -> user_analyze -> batch_send
+    5. If send_email and email are set, that address is used for the send step
     
     Args:
-        payload.send_email: Whether to send the email (default True)
-        payload.email: Override email address for testing (sends to this instead of user's email)
+        payload.send_email: Whether to send the email after the report is ready
+        payload.email: Override email address for testing
+        payload.use_batch_flow: If True, trigger full pipeline (trends -> fetch -> analyze -> send)
     
-    Note: Jobs are processed asynchronously by the worker. Use GET /weekly-report/{app_user_id}
-    to check the report status after the job completes.
+    Note: Jobs are processed asynchronously. Use GET /weekly-report/{app_user_id} to check status.
     """
-    # Validate user exists
     user = db.get(AppUser, app_user_id)
     if not user:
         raise HTTPException(status_code=404, detail="user_not_found")
-    
-    # Validate user has sec_user_id
     if not user.latest_sec_user_id:
         raise HTTPException(status_code=400, detail="sec_user_id_required")
-    
-    # Determine email address for sending (if needed)
+
     email_address: Optional[str] = None
     if payload.send_email:
-        if payload.email:
-            # Use the provided test email
-            email_address = payload.email
-        else:
-            # Fall back to user's registered email
-            email_address = _latest_user_email(db, app_user_id)
-            if not email_address:
-                raise HTTPException(status_code=400, detail="email_required_for_sending")
+        email_address = payload.email or _latest_user_email(db, app_user_id)
+        if not payload.use_batch_flow and not email_address:
+            raise HTTPException(status_code=400, detail="email_required_for_sending")
 
-    # Enqueue analysis job (force new to override any idempotency)
-    analyze_job = job_queue.enqueue(
-        db,
-        task_name="weekly_report_analyze",
-        payload={"app_user_id": app_user_id},
-        idempotency_key=f"weekly_report_analyze_test:{app_user_id}:{datetime.utcnow().isoformat()}",
-    )
-    
-    # Optionally enqueue send job (will run after analyze completes based on job ordering)
-    send_job_id = None
-    if payload.send_email:
-        send_payload = {"app_user_id": app_user_id}
-        # If a custom email is provided, pass it to the send job
-        if payload.email:
-            send_payload["email_override"] = payload.email
-        send_job = job_queue.enqueue(
-            db,
-            task_name="weekly_report_send",
-            payload=send_payload,
-            idempotency_key=f"weekly_report_send_test:{app_user_id}:{datetime.utcnow().isoformat()}",
+    fetch_trends_job_id: Optional[str] = None
+    analyze_job_id: str
+    send_job_id: Optional[str] = None
+
+    if payload.use_batch_flow:
+        # Full pipeline: create global report -> enqueue fetch_trends (limit to this user)
+        now = datetime.utcnow()
+        week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        week_end = week_start + timedelta(days=7)
+        global_report = (
+            db.query(WeeklyReportGlobal)
+            .filter(
+                WeeklyReportGlobal.period_start == week_start,
+                WeeklyReportGlobal.period_end == week_end,
+            )
+            .first()
         )
-        send_job_id = send_job.id
-    
-    logger.info(
-        "admin.test.weekly_report.enqueued",
-        extra={
-            "event": "admin.test.weekly_report.enqueued",
-            "app_user_id": app_user_id,
-            "analyze_job_id": analyze_job.id,
-            "send_job_id": send_job_id,
-            "send_email": payload.send_email,
-            "email_override": payload.email,
-        },
-    )
-    
-    # Get or create a placeholder report to return
+        if not global_report:
+            global_report = WeeklyReportGlobal(
+                period_start=week_start,
+                period_end=week_end,
+                status="pending",
+            )
+            db.add(global_report)
+            db.commit()
+            db.refresh(global_report)
+
+        fetch_trends_payload = {
+            "global_report_id": global_report.id,
+            "limit_to_app_user_ids": [app_user_id],
+        }
+        if payload.send_email and email_address:
+            fetch_trends_payload["email_override"] = email_address
+        fetch_trends_job = job_queue.enqueue(
+            db,
+            task_name="weekly_report_fetch_trends",
+            payload=fetch_trends_payload,
+            idempotency_key=f"weekly_report_fetch_trends_test:{global_report.id}:{app_user_id}:{datetime.utcnow().isoformat()}",
+        )
+        fetch_trends_job_id = fetch_trends_job.id
+        analyze_job_id = fetch_trends_job_id  # pipeline starts with fetch_trends
+        logger.info(
+            "admin.test.weekly_report.batch_flow.enqueued",
+            extra={
+                "event": "admin.test.weekly_report.batch_flow.enqueued",
+                "app_user_id": app_user_id,
+                "global_report_id": global_report.id,
+                "fetch_trends_job_id": fetch_trends_job_id,
+            },
+        )
+    else:
+        # Legacy: single-job analyze + optional send
+        analyze_job = job_queue.enqueue(
+            db,
+            task_name="weekly_report_analyze",
+            payload={"app_user_id": app_user_id},
+            idempotency_key=f"weekly_report_analyze_test:{app_user_id}:{datetime.utcnow().isoformat()}",
+        )
+        analyze_job_id = analyze_job.id
+        if payload.send_email:
+            send_payload = {"app_user_id": app_user_id}
+            if payload.email:
+                send_payload["email_override"] = payload.email
+            send_job = job_queue.enqueue(
+                db,
+                task_name="weekly_report_send",
+                payload=send_payload,
+                idempotency_key=f"weekly_report_send_test:{app_user_id}:{datetime.utcnow().isoformat()}",
+            )
+            send_job_id = send_job.id
+        logger.info(
+            "admin.test.weekly_report.enqueued",
+            extra={
+                "event": "admin.test.weekly_report.enqueued",
+                "app_user_id": app_user_id,
+                "analyze_job_id": analyze_job_id,
+                "send_job_id": send_job_id,
+                "send_email": payload.send_email,
+            },
+        )
+
     report = (
         db.query(WeeklyReport)
         .filter(WeeklyReport.app_user_id == app_user_id)
         .order_by(WeeklyReport.created_at.desc())
         .first()
     )
-    
-    # If no report exists yet, create a placeholder
     if not report:
         report = WeeklyReport(
             app_user_id=app_user_id,
@@ -555,9 +594,11 @@ async def admin_test_weekly_report(
     return WeeklyReportTestResponse(
         app_user_id=app_user_id,
         report_id=report.id,
-        analyze_job_id=analyze_job.id,
+        analyze_job_id=analyze_job_id,
         send_job_id=send_job_id,
         email_sent=False,  # Jobs are asynchronous, email not sent yet
         email_address=email_address,
         report=report_response,
+        use_batch_flow=payload.use_batch_flow,
+        fetch_trends_job_id=fetch_trends_job_id,
     )
