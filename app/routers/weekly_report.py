@@ -426,13 +426,13 @@ async def admin_test_weekly_report(
     
     This endpoint:
     1. Validates the user exists and has sec_user_id
-    2. Enqueues the weekly_report_analyze job
-    3. If send_email is True, also enqueues the weekly_report_send job
+    2. Enqueues the weekly_report_analyze job (coverage, summary, summary_snapshot, samples, LLM, Node HTML)
+    3. Only if send_email is True, enqueues the weekly_report_send job (default False: no email sent)
     4. Returns the job information
     
     Args:
-        payload.send_email: Whether to send the email (default True)
-        payload.email: Override email address for testing (sends to this instead of user's email)
+        payload.send_email: Whether to send the email after analysis (default False; set True to actually send)
+        payload.email: Override email address for testing (sends to this instead of user's email; only used when send_email is True)
     
     Note: Jobs are processed asynchronously by the worker. Use GET /weekly-report/{app_user_id}
     to check the report status after the job completes.

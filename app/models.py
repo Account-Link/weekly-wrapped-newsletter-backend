@@ -188,6 +188,7 @@ class WeeklyReport(Base):
     rabbit_hole_count = Column(Integer, nullable=True)
     rabbit_hole_category = Column(String, nullable=True)
     nudge_text = Column(String, nullable=True)
+    summary_snapshot = Column(JSON, nullable=True)  # archive summary fields: top_creators, top_music, night, peak_hour, etc.
 
 class OutfitCatalog(Base):
     __tablename__ = "f_outfit_catalog"

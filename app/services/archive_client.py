@@ -190,6 +190,20 @@ class ArchiveClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def watch_history_analytics_leaderboard(
+        self, start_at: str, end_at: str, limit: int = 100
+    ) -> JSONDict:
+        """Fetch global leaderboard (hashtags, songs, creators) for a time range."""
+        body: JSONDict = {"start_at": start_at, "end_at": end_at, "limit": limit}
+        resp = await self._request(
+            "POST",
+            "/archive/xordi/watch-history/analytics/leaderboard",
+            json=body,
+            headers=await self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def watch_history_analytics_summary(
         self,
         sec_user_id: str,

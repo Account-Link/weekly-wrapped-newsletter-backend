@@ -3435,6 +3435,21 @@ async def handle_weekly_report_analyze(job: LeasedJob) -> bool:
         # 3 inches = 0.0000473485 miles, so videos * 0.0000473485
         report.miles_scrolled = int(round(total_videos * 0.0000473485 * 1000))  # in 1/1000 miles for precision
 
+        # Persist selected summary fields (same as user_analyze flow; used by single-user test)
+        summary_snapshot_legacy: Dict[str, Any] = {}
+        if isinstance(summary, dict):
+            if "totals" in summary:
+                summary_snapshot_legacy["totals"] = summary["totals"]
+            if "top_creators" in summary:
+                summary_snapshot_legacy["top_creators"] = summary["top_creators"]
+            if "top_music" in summary:
+                summary_snapshot_legacy["top_music"] = summary["top_music"]
+            if "night" in summary:
+                summary_snapshot_legacy["night"] = summary["night"]
+            if "peak_hour" in summary:
+                summary_snapshot_legacy["peak_hour"] = summary["peak_hour"]
+        report.summary_snapshot = summary_snapshot_legacy if summary_snapshot_legacy else None
+
         # Get previous week's total_time for comparison
         prev_week_start = week_start - timedelta(days=7)
         prev_report = (
@@ -3568,6 +3583,7 @@ async def handle_weekly_report_analyze(job: LeasedJob) -> bool:
                     "rabbit_hole_count": report.rabbit_hole_count,
                     "rabbit_hole_category": report.rabbit_hole_category,
                     "nudge_text": report.nudge_text,
+                    "summary_snapshot": report.summary_snapshot,
                 }
                 # New API format: {"uid": app_user_id, "params": {...}}
                 node_payload = {
@@ -4121,22 +4137,42 @@ async def handle_weekly_report_global_analyze(job: LeasedJob) -> bool:
         
         total_watch_hours = total_time_seconds / 3600.0 if total_time_seconds > 0 else 0.0
         
-        # TODO: Implement actual global analysis logic here
-        # This is a placeholder - can add:
-        # - Average watch time per user
-        # - Global trending topics
-        # - User percentile calculations
-        # - Cross-user pattern detection
         analysis_result = {
             "fetched_users": fetched_users,
             "total_videos": total_videos,
             "total_watch_hours": round(total_watch_hours, 2),
             "avg_videos_per_user": round(total_videos / fetched_users, 2) if fetched_users > 0 else 0,
             "avg_watch_hours_per_user": round(total_watch_hours / fetched_users, 2) if fetched_users > 0 else 0,
-            # Placeholder for future analysis fields
             "trending_topics": [],
             "global_patterns": {},
         }
+        # Fetch global leaderboard from archive (hashtags, songs, creators)
+        week_start = global_report.period_start
+        week_end = global_report.period_end
+        if week_start and week_end:
+            try:
+                leaderboard = await archive_client.watch_history_analytics_leaderboard(
+                    start_at=_iso_utc(week_start),
+                    end_at=_iso_utc(week_end),
+                    limit=100,
+                )
+                analysis_result["leaderboard"] = {
+                    "hashtags": leaderboard.get("hashtags") or [],
+                    "songs": leaderboard.get("songs") or [],
+                    "creators": leaderboard.get("creators") or [],
+                }
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_global_analyze.leaderboard_failed",
+                    extra={
+                        "event": "weekly_report_global_analyze.leaderboard_failed",
+                        "global_report_id": global_report_id,
+                        "error": str(exc),
+                    },
+                )
+                analysis_result["leaderboard"] = {"hashtags": [], "songs": [], "creators": []}
+        else:
+            analysis_result["leaderboard"] = {"hashtags": [], "songs": [], "creators": []}
         
         global_report.total_videos = total_videos
         global_report.total_watch_hours = total_watch_hours
@@ -4386,6 +4422,21 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
         # Calculate miles_scrolled (estimate: ~3 inches per video swipe, converted to miles)
         report.miles_scrolled = int(round(total_videos * 0.0000473485 * 1000))
         
+        # Persist selected summary fields to report (top_creators, top_music, night, peak_hour, totals)
+        summary_snapshot: Dict[str, Any] = {}
+        if isinstance(summary, dict):
+            if "totals" in summary:
+                summary_snapshot["totals"] = summary["totals"]
+            if "top_creators" in summary:
+                summary_snapshot["top_creators"] = summary["top_creators"]
+            if "top_music" in summary:
+                summary_snapshot["top_music"] = summary["top_music"]
+            if "night" in summary:
+                summary_snapshot["night"] = summary["night"]
+            if "peak_hour" in summary:
+                summary_snapshot["peak_hour"] = summary["peak_hour"]
+        report.summary_snapshot = summary_snapshot if summary_snapshot else None
+        
         # Get previous week's total_time for comparison
         prev_week_start = week_start - timedelta(days=7)
         prev_report = (
@@ -4522,6 +4573,7 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
                     "rabbit_hole_count": report.rabbit_hole_count,
                     "rabbit_hole_category": report.rabbit_hole_category,
                     "nudge_text": report.nudge_text,
+                    "summary_snapshot": report.summary_snapshot,
                 }
                 node_payload = {
                     "uid": app_user_id,
