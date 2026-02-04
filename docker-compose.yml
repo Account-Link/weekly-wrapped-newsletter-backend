@@ -59,9 +59,7 @@ services:
     command: ["sh", "-lc", "uv run python -m app.worker"]
     env_file: .env
     environment:
-      # NOTE: 邮件发送任务已禁用。需要发送时，将 email_send / weekly_report_send 加回。
-      # 周报完整流程需包含: weekly_report_fetch_trends, weekly_report_batch_fetch, weekly_report_user_fetch, weekly_report_global_analyze, weekly_report_batch_analyze, weekly_report_user_analyze, weekly_report_batch_send
-      - WORKER_TASK_ALLOW=wrapped_analysis,watch_history_verify,reauth_notify,llm_personality,llm_personality_explanation,llm_niche_journey,llm_top_niche_percentile,llm_brainrot,llm_brainrot_explanation,llm_keyword_2026,llm_thumb_roast,weekly_report_analyze,weekly_report_fetch_trends,weekly_report_batch_fetch,weekly_report_user_fetch,weekly_report_global_analyze,weekly_report_batch_analyze,weekly_report_user_analyze,weekly_report_batch_send
+      - WORKER_TASK_ALLOW=wrapped_analysis,watch_history_verify,reauth_notify,llm_personality,llm_personality_explanation,llm_niche_journey,llm_top_niche_percentile,llm_brainrot,llm_brainrot_explanation,llm_keyword_2026,llm_thumb_roast,email_send,weekly_report_analyze,weekly_report_fetch_trends,weekly_report_batch_fetch,weekly_report_user_fetch,weekly_report_global_analyze,weekly_report_batch_analyze,weekly_report_user_analyze,weekly_report_batch_send,weekly_report_send
       - WORKER_JOB_CONCURRENCY=10
     volumes:
       - .:/app
