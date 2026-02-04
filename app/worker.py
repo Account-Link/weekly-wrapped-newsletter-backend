@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -31,9 +31,11 @@ from app.models import (
     ReferralEvent,
     WeeklyReport,
     WeeklyReportGlobal,
+    TikTokRadarHeaderConfig,
     WeeklyTrendCreator,
     WeeklyTrendHashtag,
     WeeklyTrendSound,
+    OutfitCatalog,
 )
 from app.observability import bind_context, clear_context, get_logger, sanitize_json_text, set_service, setup_logging
 from app.prompts import (
@@ -48,16 +50,23 @@ from app.prompts import (
     ROAST_THUMB_PROMPT,
     TOP_NICHES_PROMPT,
     WEEKLY_FEEDING_STATE_PROMPT,
-    WEEKLY_TOPICS_PROMPT,
-    WEEKLY_RABBIT_HOLE_PROMPT,
     WEEKLY_NUDGE_PROMPT,
+    WEEKLY_RABBIT_HOLE_PROMPT,
+    WEEKLY_TOPICS_PROMPT,
     accessory_fallback_reason,
 )
 from app.services.archive_client import ArchiveClient
 from app.services.job_queue import DBJobQueue
 from app.services.session_service import SessionService
-from app.services.tiktok_creative_radar_capture import capture_headers as capture_tiktok_radar_headers
 from app.services.tiktok_creative_radar_client import TikTokCreativeRadarClient, TikTokCreativeRadarError
+from app.services.weekly_report_analysis import (
+    compute_content_diversity_score,
+    derive_feedling_state,
+    derive_new_topics,
+    derive_nudge_text,
+    derive_rabbit_hole,
+    extract_brainrot_pct,
+)
 from app.settings import get_settings
 
 job_queue = DBJobQueue()
@@ -83,6 +92,9 @@ WATCH_HISTORY_VERIFY_FINALIZE_MAX_ATTEMPTS = max(
     1, int(os.getenv("WATCH_HISTORY_VERIFY_FINALIZE_MAX_ATTEMPTS", "60"))
 )
 LLM_CONCURRENCY = max(1, int(os.getenv("LLM_CONCURRENCY", "2")))
+WEEKLY_REPORT_HISTORY_PAGE_LIMIT = max(50, int(os.getenv("WEEKLY_REPORT_HISTORY_PAGE_LIMIT", "1000")))
+WEEKLY_REPORT_HISTORY_MAX_PAGES = max(1, int(os.getenv("WEEKLY_REPORT_HISTORY_MAX_PAGES", "8")))
+WEEKLY_REPORT_LLM_REFINEMENT_ENABLED = os.getenv("WEEKLY_REPORT_LLM_REFINEMENT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
@@ -115,6 +127,20 @@ class LeasedJob:
     id: str
     task_name: str
     payload: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TrendCandidate:
+    key: str
+    trend_type: str
+    trend_name: str
+    rank: int
+    creator_ids: Tuple[str, ...] = ()
+    sound_ids: Tuple[str, ...] = ()
+    hashtags: Tuple[str, ...] = ()
+    match_terms: Tuple[str, ...] = ()
+    reach_start_hint: Optional[float] = None
+    reach_end_hint: Optional[float] = None
 
 CAT_NAMES = [
     "cat_white",
@@ -1174,6 +1200,992 @@ def _extract_json_value(text: str) -> Optional[Any]:
         except Exception:
             continue
     return None
+
+
+def _normalize_match_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _compact_match_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _normalize_match_text(value))
+
+
+def _safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _total_time_to_minutes(value: Any) -> int:
+    """Normalize weekly_report.total_time to minutes.
+
+    Legacy runs may have written seconds; those values are always > 7-day max minutes.
+    """
+    with suppress(Exception):
+        raw = int(value or 0)
+        if raw <= 0:
+            return 0
+        # 7 days * 24h * 60m; anything larger is treated as seconds.
+        if raw > 10080:
+            return int(round(raw / 60.0))
+        return raw
+    return 0
+
+
+def _parse_watched_at_value(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        with suppress(Exception):
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+    text = _safe_str(value)
+    if not text:
+        return None
+    if text.isdigit():
+        return _parse_watched_at_value(int(text))
+    return _parse_iso_datetime(text)
+
+
+def _to_pct(val: Any) -> Optional[float]:
+    with suppress(Exception):
+        num = float(val)
+        if num < 0:
+            return None
+        if num <= 1.0:
+            num *= 100.0
+        return round(min(num, 100.0), 2)
+    return None
+
+
+def _extract_reach_hints(trend_payload: Any) -> Tuple[Optional[float], Optional[float]]:
+    if not isinstance(trend_payload, dict):
+        return None, None
+    start_keys = ("penetration_start", "reach_start", "start_pct", "start")
+    end_keys = ("penetration_end", "reach_end", "end_pct", "end")
+    start_val: Optional[float] = None
+    end_val: Optional[float] = None
+    for key in start_keys:
+        if key in trend_payload and start_val is None:
+            start_val = _to_pct(trend_payload.get(key))
+    for key in end_keys:
+        if key in trend_payload and end_val is None:
+            end_val = _to_pct(trend_payload.get(key))
+    if start_val is None and end_val is None:
+        # Some radar payloads only expose single trend score/ratio.
+        single = _to_pct(trend_payload.get("value") or trend_payload.get("ratio") or trend_payload.get("score"))
+        if single is not None:
+            return 0.0, single
+    return start_val, end_val
+
+
+def _extract_history_hashtags(row: Dict[str, Any]) -> List[str]:
+    raw = row.get("hashtags")
+    if isinstance(raw, list):
+        tags = [str(v).strip().lstrip("#") for v in raw if str(v).strip()]
+    elif isinstance(raw, str):
+        tags = [v.strip().lstrip("#") for v in re.split(r"[\s,]+", raw) if v.strip()]
+    else:
+        tags = []
+
+    if tags:
+        return list(dict.fromkeys(tags[:12]))
+
+    text = f"{_safe_str(row.get('title'))} {_safe_str(row.get('description'))}".strip()
+    inferred = re.findall(r"#([A-Za-z0-9_]+)", text)
+    if not inferred:
+        return []
+    return list(dict.fromkeys(inferred[:12]))
+
+
+def _history_row_to_topic_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    music = row.get("music")
+    if isinstance(music, dict):
+        music_payload: Dict[str, Any] = {
+            "title": _safe_str(music.get("title")),
+            "author": _safe_str(music.get("author")),
+        }
+    else:
+        music_payload = {"title": _safe_str(music), "author": ""}
+    return {
+        "title": _safe_str(row.get("title")),
+        "description": _safe_str(row.get("description")),
+        "hashtags": _extract_history_hashtags(row),
+        "music": music_payload,
+        "author": _safe_str(row.get("author")),
+        "watched_at": row.get("watched_at"),
+    }
+
+
+async def _fetch_watch_history_rows_for_range(
+    *,
+    sec_user_id: str,
+    start_at: datetime,
+    end_at: datetime,
+    max_pages: int,
+    page_limit: int,
+) -> List[Dict[str, Any]]:
+    rows_in_range: List[Dict[str, Any]] = []
+    before: Optional[str] = None
+    pages = 0
+    reached_older_than_start = False
+
+    while pages < max(1, max_pages) and not reached_older_than_start:
+        data = await archive_client.get_watch_history(
+            sec_user_id=sec_user_id,
+            limit=max(1, page_limit),
+            before=before,
+        )
+        rows = data.get("rows") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or not rows:
+            break
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            watched_at = _parse_watched_at_value(row.get("watched_at"))
+            if not watched_at:
+                continue
+            if watched_at < start_at:
+                reached_older_than_start = True
+                continue
+            if watched_at >= end_at:
+                continue
+            rows_in_range.append(row)
+
+        next_before = data.get("next_before") if isinstance(data, dict) else None
+        if not isinstance(next_before, str) or not next_before.strip():
+            break
+        before = next_before.strip()
+        pages += 1
+
+    return rows_in_range
+
+
+async def _fetch_latest_watched_at(sec_user_id: str) -> Optional[datetime]:
+    with suppress(Exception):
+        data = await archive_client.get_watch_history(sec_user_id=sec_user_id, limit=1, before=None)
+        rows = data.get("rows") if isinstance(data, dict) else None
+        if isinstance(rows, list) and rows:
+            row = rows[0]
+            if isinstance(row, dict):
+                return _parse_watched_at_value(row.get("watched_at"))
+    return None
+
+
+def _topic_tokens(text: str) -> List[str]:
+    return [tok for tok in re.findall(r"[a-z0-9]+", _normalize_match_text(text)) if len(tok) >= 3]
+
+
+def _pick_topic_pic(topic: str, catalog_rows: List[OutfitCatalog]) -> str:
+    tokens = _topic_tokens(topic)
+    if not tokens or not catalog_rows:
+        return ""
+    best_score = 0
+    best_pic = ""
+    for row in catalog_rows:
+        pic = _safe_str(getattr(row, "pic", None))
+        if not pic:
+            continue
+        desc = _normalize_match_text(
+            " ".join(
+                [
+                    _safe_str(getattr(row, "description_en", None)),
+                    _safe_str(getattr(row, "description_cn", None)),
+                ]
+            )
+        )
+        meta = _normalize_match_text(
+            " ".join(
+                [
+                    _safe_str(getattr(row, "display_name", None)),
+                    _safe_str(getattr(row, "name_display_text", None)),
+                    _safe_str(getattr(row, "belongs_to_series", None)),
+                    _safe_str(getattr(row, "set_series", None)),
+                    _safe_str(getattr(row, "internal_name", None)),
+                    _safe_str(getattr(row, "internal_name_overlay", None)),
+                    _safe_str(getattr(row, "internal_name_accessory", None)),
+                ]
+            )
+        )
+        score = 0
+        for tok in tokens:
+            if tok in desc:
+                score += 3
+            if tok in meta:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_pic = pic
+    return best_pic if best_score > 0 else ""
+
+
+def _attach_topic_images(db, topics: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if not topics:
+        return topics
+    rows = (
+        db.query(OutfitCatalog)
+        .filter(
+            OutfitCatalog.deleted_at.is_(None),
+            OutfitCatalog.pic.isnot(None),
+        )
+        .all()
+    )
+    for topic in topics:
+        topic_name = _safe_str(topic.get("topic"))
+        pic = _safe_str(topic.get("pic_url"))
+        if pic or not topic_name:
+            continue
+        topic["pic_url"] = _pick_topic_pic(topic_name, rows)
+    return topics
+
+
+def _build_weekly_llm_sample_texts(items: List[Dict[str, Any]], limit: int = 40) -> List[str]:
+    lines: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = _safe_str(item.get("title"))
+        desc = _safe_str(item.get("description"))
+        author = _safe_str(item.get("author"))
+        hashtags = item.get("hashtags")
+        if isinstance(hashtags, list):
+            tags = [f"#{_safe_str(tag).lstrip('#')}" for tag in hashtags if _safe_str(tag)]
+        elif isinstance(hashtags, str):
+            tags = [f"#{tok.lstrip('#')}" for tok in re.split(r"[\s,]+", hashtags) if tok.strip()]
+        else:
+            tags = []
+        watched_at = _safe_str(item.get("watched_at"))
+        line = " | ".join(
+            part
+            for part in [
+                f"title:{title[:180]}" if title else "",
+                f"desc:{desc[:220]}" if desc else "",
+                f"author:{author}" if author else "",
+                f"tags:{' '.join(tags[:10])}" if tags else "",
+                f"watched_at:{watched_at}" if watched_at else "",
+            ]
+            if part
+        )
+        if line:
+            lines.append(line)
+        if len(lines) >= max(10, limit):
+            break
+    return lines
+
+
+def _normalize_llm_topic_items(value: Any) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    if not isinstance(value, list):
+        return out
+    for item in value[:3]:
+        topic = ""
+        if isinstance(item, dict):
+            topic = _safe_str(item.get("topic"))
+        elif isinstance(item, str):
+            topic = _safe_str(item)
+        if not topic:
+            continue
+        # Reuse the same normalization rules as deterministic pipeline.
+        normalized = re.sub(r"\s+", " ", topic.replace("_", " ").replace("-", " ")).strip()
+        if not normalized:
+            continue
+        out.append({"topic": normalized[:64], "pic_url": ""})
+    return out
+
+
+async def _run_weekly_llm_refinement(
+    *,
+    weekly_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not WEEKLY_REPORT_LLM_REFINEMENT_ENABLED:
+        return {}
+    sample_texts = _build_weekly_llm_sample_texts(weekly_items, limit=40)
+    if not sample_texts:
+        return {}
+
+    async def _safe_call(prompt: str, temp: float = 0.3) -> str:
+        with suppress(Exception):
+            return await _call_llm(prompt, sample_texts, temperature=temp)
+        return ""
+
+    topics_raw, rabbit_raw, feeding_raw, nudge_raw = await asyncio.gather(
+        _safe_call(WEEKLY_TOPICS_PROMPT, 0.4),
+        _safe_call(WEEKLY_RABBIT_HOLE_PROMPT, 0.2),
+        _safe_call(WEEKLY_FEEDING_STATE_PROMPT, 0.1),
+        _safe_call(WEEKLY_NUDGE_PROMPT, 0.6),
+    )
+
+    llm_topics = _normalize_llm_topic_items(_extract_json_value(topics_raw))
+
+    llm_rabbit_category: Optional[str] = None
+    llm_rabbit_count: Optional[int] = None
+    rabbit_parsed = _extract_json_value(rabbit_raw)
+    if isinstance(rabbit_parsed, dict):
+        category = _safe_str(rabbit_parsed.get("category"))
+        count_raw = rabbit_parsed.get("count")
+        count: Optional[int] = None
+        with suppress(Exception):
+            if count_raw is not None:
+                count = int(float(count_raw))
+        if category and count and count > 0:
+            llm_rabbit_category = category[:64]
+            llm_rabbit_count = count
+
+    llm_feeding_state = _safe_str(feeding_raw).split()[0].strip().lower() if _safe_str(feeding_raw) else ""
+    if llm_feeding_state not in {"curious", "excited", "cozy", "sleepy", "dizzy"}:
+        llm_feeding_state = ""
+
+    llm_nudge = _safe_str(nudge_raw).replace("\n", " ").strip()
+    if llm_nudge and len(llm_nudge) > 80:
+        llm_nudge = llm_nudge[:80].rstrip()
+
+    return {
+        "topics": llm_topics,
+        "rabbit_category": llm_rabbit_category,
+        "rabbit_count": llm_rabbit_count,
+        "feeding_state": llm_feeding_state or None,
+        "nudge_text": llm_nudge or None,
+    }
+
+
+def _candidate_from_creator(row: WeeklyTrendCreator) -> Optional[TrendCandidate]:
+    user_id = _safe_str(row.user_id)
+    tcm_id = _safe_str(row.tcm_id)
+    trend_name = _safe_str(row.nick_name) or user_id or tcm_id
+    key_source = user_id or tcm_id or f"rank-{row.rank}"
+    if not trend_name:
+        return None
+    terms: List[str] = []
+    norm_name = _normalize_match_text(trend_name)
+    if len(norm_name) >= 3:
+        terms.append(norm_name)
+    return TrendCandidate(
+        key=f"creator:{key_source}",
+        trend_type="creator",
+        trend_name=trend_name,
+        rank=int(row.rank or 9999),
+        creator_ids=tuple(v for v in (user_id, tcm_id) if v),
+        match_terms=tuple(dict.fromkeys(terms)),
+    )
+
+
+def _candidate_from_sound(row: WeeklyTrendSound) -> Optional[TrendCandidate]:
+    song_id = _safe_str(row.song_id)
+    clip_id = _safe_str(row.clip_id)
+    trend_name = _safe_str(row.title) or song_id or clip_id
+    key_source = song_id or clip_id or f"rank-{row.rank}"
+    if not trend_name:
+        return None
+    terms: List[str] = []
+    for raw in (trend_name, row.author):
+        norm = _normalize_match_text(raw)
+        if len(norm) >= 3:
+            terms.append(norm)
+    reach_start_hint, reach_end_hint = _extract_reach_hints(row.trend)
+    return TrendCandidate(
+        key=f"sound:{key_source}",
+        trend_type="sound",
+        trend_name=trend_name,
+        rank=int(row.rank or 9999),
+        sound_ids=tuple(v for v in (song_id, clip_id) if v),
+        match_terms=tuple(dict.fromkeys(terms)),
+        reach_start_hint=reach_start_hint,
+        reach_end_hint=reach_end_hint,
+    )
+
+
+def _candidate_from_hashtag(row: WeeklyTrendHashtag) -> Optional[TrendCandidate]:
+    hashtag_id = _safe_str(row.hashtag_id)
+    hashtag_name = _safe_str(row.hashtag_name)
+    key_source = hashtag_id or hashtag_name or f"rank-{row.rank}"
+    if not hashtag_name:
+        return None
+    normalized = hashtag_name.lstrip("#").strip()
+    compact = _compact_match_text(normalized)
+    tags: List[str] = []
+    if compact:
+        tags.append(compact)
+    trend_name = normalized if normalized.startswith("#") else f"#{normalized}" if normalized else hashtag_name
+    reach_start_hint, reach_end_hint = _extract_reach_hints(row.trend)
+    return TrendCandidate(
+        key=f"hashtag:{key_source}",
+        trend_type="hashtag",
+        trend_name=trend_name,
+        rank=int(row.rank or 9999),
+        hashtags=tuple(dict.fromkeys(tags)),
+        match_terms=tuple(dict.fromkeys([_normalize_match_text(normalized)] if normalized else [])),
+        reach_start_hint=reach_start_hint,
+        reach_end_hint=reach_end_hint,
+    )
+
+
+def _build_weekly_trend_candidates(db, global_report_id: int) -> List[TrendCandidate]:
+    candidates: List[TrendCandidate] = []
+    fallback_to_previous = os.getenv("WEEKLY_TREND_FALLBACK_TO_PREVIOUS", "true").lower() in ("1", "true", "yes", "on")
+    creators = (
+        db.query(WeeklyTrendCreator)
+        .filter(WeeklyTrendCreator.global_report_id == global_report_id)
+        .order_by(WeeklyTrendCreator.rank.asc())
+        .all()
+    )
+    if not creators and fallback_to_previous:
+        latest_creator_gid = (
+            db.query(WeeklyTrendCreator.global_report_id)
+            .filter(WeeklyTrendCreator.global_report_id != global_report_id)
+            .order_by(WeeklyTrendCreator.global_report_id.desc())
+            .limit(1)
+            .scalar()
+        )
+        if latest_creator_gid:
+            creators = (
+                db.query(WeeklyTrendCreator)
+                .filter(WeeklyTrendCreator.global_report_id == latest_creator_gid)
+                .order_by(WeeklyTrendCreator.rank.asc())
+                .all()
+            )
+
+    sounds = (
+        db.query(WeeklyTrendSound)
+        .filter(WeeklyTrendSound.global_report_id == global_report_id)
+        .order_by(WeeklyTrendSound.rank.asc())
+        .all()
+    )
+    if not sounds and fallback_to_previous:
+        latest_sound_gid = (
+            db.query(WeeklyTrendSound.global_report_id)
+            .filter(WeeklyTrendSound.global_report_id != global_report_id)
+            .order_by(WeeklyTrendSound.global_report_id.desc())
+            .limit(1)
+            .scalar()
+        )
+        if latest_sound_gid:
+            sounds = (
+                db.query(WeeklyTrendSound)
+                .filter(WeeklyTrendSound.global_report_id == latest_sound_gid)
+                .order_by(WeeklyTrendSound.rank.asc())
+                .all()
+            )
+
+    hashtags = (
+        db.query(WeeklyTrendHashtag)
+        .filter(WeeklyTrendHashtag.global_report_id == global_report_id)
+        .order_by(WeeklyTrendHashtag.rank.asc())
+        .all()
+    )
+    if not hashtags and fallback_to_previous:
+        latest_hashtag_gid = (
+            db.query(WeeklyTrendHashtag.global_report_id)
+            .filter(WeeklyTrendHashtag.global_report_id != global_report_id)
+            .order_by(WeeklyTrendHashtag.global_report_id.desc())
+            .limit(1)
+            .scalar()
+        )
+        if latest_hashtag_gid:
+            hashtags = (
+                db.query(WeeklyTrendHashtag)
+                .filter(WeeklyTrendHashtag.global_report_id == latest_hashtag_gid)
+                .order_by(WeeklyTrendHashtag.rank.asc())
+                .all()
+            )
+    for row in creators:
+        candidate = _candidate_from_creator(row)
+        if candidate:
+            candidates.append(candidate)
+    for row in sounds:
+        candidate = _candidate_from_sound(row)
+        if candidate:
+            candidates.append(candidate)
+    for row in hashtags:
+        candidate = _candidate_from_hashtag(row)
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _extract_hashtag_tokens(item: Dict[str, Any], text_blob: str) -> Set[str]:
+    tokens: Set[str] = set()
+    raw_hashtags = item.get("hashtags")
+    if isinstance(raw_hashtags, list):
+        for tag in raw_hashtags:
+            compact = _compact_match_text(str(tag).lstrip("#"))
+            if compact:
+                tokens.add(compact)
+    elif isinstance(raw_hashtags, str):
+        for tok in re.split(r"[\s,]+", raw_hashtags):
+            compact = _compact_match_text(tok.lstrip("#"))
+            if compact:
+                tokens.add(compact)
+    for match in re.findall(r"#([a-zA-Z0-9_]+)", text_blob):
+        compact = _compact_match_text(match)
+        if compact:
+            tokens.add(compact)
+    return tokens
+
+
+def _extract_music_names(item: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    music = item.get("music")
+    if isinstance(music, dict):
+        for raw in (music.get("title"), music.get("author")):
+            val = _normalize_match_text(raw)
+            if val:
+                out.append(val)
+    else:
+        val = _normalize_match_text(music)
+        if val:
+            out.append(val)
+    for raw in (item.get("music_title"), item.get("sound_title"), item.get("song_title")):
+        val = _normalize_match_text(raw)
+        if val:
+            out.append(val)
+    return list(dict.fromkeys(out))
+
+
+def _extract_sound_ids(item: Dict[str, Any]) -> Set[str]:
+    ids: Set[str] = set()
+    for key in ("song_id", "clip_id", "sound_id", "music_id"):
+        val = _safe_str(item.get(key))
+        if val:
+            ids.add(val)
+    music = item.get("music")
+    if isinstance(music, dict):
+        for key in ("song_id", "clip_id", "sound_id", "music_id", "id"):
+            val = _safe_str(music.get(key))
+            if val:
+                ids.add(val)
+    return ids
+
+
+def _match_trends_for_samples(
+    sample_items: List[Dict[str, Any]],
+    candidates: List[TrendCandidate],
+) -> Dict[str, datetime]:
+    matched_first_seen: Dict[str, datetime] = {}
+    if not sample_items or not candidates:
+        return matched_first_seen
+
+    for item in sample_items:
+        if not isinstance(item, dict):
+            continue
+        watched_at = _parse_watched_at_value(item.get("watched_at") or item.get("watchedAt"))
+        if watched_at is None:
+            continue
+
+        title = _safe_str(item.get("title"))
+        description = _safe_str(item.get("description"))
+        text_blob = " ".join(
+            v
+            for v in [
+                _safe_str(item.get("text")),
+                title,
+                description,
+                " ".join(_extract_music_names(item)),
+                _safe_str(item.get("author")),
+            ]
+            if v
+        )
+        text_norm = _normalize_match_text(text_blob)
+        text_compact = _compact_match_text(text_blob)
+        author_id = _safe_str(item.get("author_id") or item.get("authorId"))
+        author_name = _normalize_match_text(item.get("author"))
+        music_names = _extract_music_names(item)
+        sound_ids = _extract_sound_ids(item)
+        hashtag_tokens = _extract_hashtag_tokens(item, text_blob)
+
+        for candidate in candidates:
+            is_match = False
+            if candidate.trend_type == "creator":
+                if author_id and candidate.creator_ids and author_id in candidate.creator_ids:
+                    is_match = True
+                elif author_name and any(term and term in author_name for term in candidate.match_terms):
+                    is_match = True
+                elif text_norm and any(term and term in text_norm for term in candidate.match_terms):
+                    is_match = True
+            elif candidate.trend_type == "sound":
+                if candidate.sound_ids and sound_ids and any(sid in candidate.sound_ids for sid in sound_ids):
+                    is_match = True
+                elif music_names and any(term and term in mn for mn in music_names for term in candidate.match_terms):
+                    is_match = True
+                elif text_norm and any(term and term in text_norm for term in candidate.match_terms):
+                    is_match = True
+            elif candidate.trend_type == "hashtag":
+                if candidate.hashtags and any(tag in hashtag_tokens for tag in candidate.hashtags):
+                    is_match = True
+                elif text_compact and any(tag and tag in text_compact for tag in candidate.hashtags):
+                    is_match = True
+                elif text_norm and any(term and term in text_norm for term in candidate.match_terms):
+                    is_match = True
+
+            if not is_match:
+                continue
+            prev = matched_first_seen.get(candidate.key)
+            if prev is None or watched_at < prev:
+                matched_first_seen[candidate.key] = watched_at
+    return matched_first_seen
+
+
+async def _llm_pick_trend_for_user(
+    sample_items: List[Dict[str, Any]],
+    candidates: List[TrendCandidate],
+) -> Optional[str]:
+    if not sample_items or not candidates:
+        return None
+    if not os.getenv("OPENROUTER_API_KEY") or not os.getenv("OPENROUTER_MODEL"):
+        return None
+
+    shortlist = sorted(candidates, key=lambda c: c.rank)[:40]
+    candidate_lines = [f"{c.key} | {c.trend_type} | {c.trend_name}" for c in shortlist]
+
+    user_lines: List[str] = []
+    for item in sample_items[:25]:
+        if not isinstance(item, dict):
+            continue
+        watched_at = _safe_str(item.get("watched_at") or item.get("watchedAt"))
+        title = _safe_str(item.get("title"))
+        music = ", ".join(_extract_music_names(item))
+        author = _safe_str(item.get("author"))
+        hashtags = item.get("hashtags")
+        hashtag_text = ", ".join(str(h) for h in hashtags[:6]) if isinstance(hashtags, list) else _safe_str(hashtags)
+        sound_ids = ",".join(sorted(_extract_sound_ids(item)))
+        text = _safe_str(item.get("text"))
+        user_lines.append(
+            f"- watched_at={watched_at} title={title} music={music} sound_ids={sound_ids} author={author} hashtags={hashtag_text} text={text}"
+        )
+    if not user_lines:
+        return None
+
+    prompt = (
+        "You are matching a user's weekly watch history to a list of TikTok trends.\n"
+        "Pick the SINGLE best matching trend key from the provided candidate list.\n"
+        "If nothing clearly matches, return null.\n"
+        "Return ONLY JSON: {\"trend_key\": \"...\"} or {\"trend_key\": null}."
+    )
+    body = "Candidates:\n" + "\n".join(candidate_lines) + "\n\nWatch history:\n" + "\n".join(user_lines)
+    llm_raw = await _call_llm(prompt, [body], temperature=0.0)
+    parsed = _extract_json_value(llm_raw)
+    if not isinstance(parsed, dict):
+        return None
+    key = parsed.get("trend_key")
+    if not isinstance(key, str):
+        return None
+    key = key.strip()
+    if not key:
+        return None
+    allowed = {c.key for c in shortlist}
+    return key if key in allowed else None
+
+
+async def _compute_weekly_trend_discovery(
+    db,
+    *,
+    global_report_id: int,
+    user_reports: List[WeeklyReport],
+    week_start: datetime,
+    week_end: datetime,
+) -> Dict[str, Any]:
+    candidates = _build_weekly_trend_candidates(db, global_report_id)
+    if not candidates or not user_reports:
+        return {"enabled": False, "reason": "missing_candidates_or_users", "per_user": {}, "trend_stats": {}}
+
+    candidate_map: Dict[str, TrendCandidate] = {c.key: c for c in candidates}
+    app_user_ids = [r.app_user_id for r in user_reports if r.app_user_id]
+    users = db.query(AppUser).filter(AppUser.app_user_id.in_(app_user_ids)).all() if app_user_ids else []
+    sec_user_map = {u.app_user_id: _safe_str(u.latest_sec_user_id) for u in users}
+    tz_map = {u.app_user_id: _safe_str(u.time_zone) or "UTC" for u in users}
+
+    range_spec: Dict[str, Any] = {"type": "between", "start_at": _iso_utc(week_start), "end_at": _iso_utc(week_end)}
+    sample_limit = max(30, int(os.getenv("WEEKLY_TREND_MATCH_SAMPLE_LIMIT", "160")))
+    history_page_limit = max(50, int(os.getenv("WEEKLY_TREND_MATCH_HISTORY_PAGE_LIMIT", "500")))
+    history_max_pages = max(1, int(os.getenv("WEEKLY_TREND_MATCH_HISTORY_MAX_PAGES", "4")))
+    llm_fallback_enabled = os.getenv("WEEKLY_TREND_MATCH_LLM_FALLBACK", "true").lower() in ("1", "true", "yes", "on")
+
+    user_matches: Dict[str, Dict[str, datetime]] = {}
+    trend_discoverers: Dict[str, List[Tuple[str, datetime]]] = {}
+
+    for report in user_reports:
+        app_user_id = _safe_str(report.app_user_id)
+        if not app_user_id:
+            continue
+        sec_user_id = sec_user_map.get(app_user_id)
+        if not sec_user_id:
+            user_matches[app_user_id] = {}
+            continue
+
+        sample_items: List[Dict[str, Any]] = []
+        # First try raw watch-history rows (contains richer author_id/hashtags/music payload).
+        try:
+            history_rows = await _fetch_watch_history_rows_for_range(
+                sec_user_id=sec_user_id,
+                start_at=week_start,
+                end_at=week_end,
+                max_pages=history_max_pages,
+                page_limit=history_page_limit,
+            )
+            if history_rows:
+                sample_items = history_rows
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_global_analyze.trend_history_rows_failed",
+                extra={
+                    "event": "weekly_report_global_analyze.trend_history_rows_failed",
+                    "global_report_id": global_report_id,
+                    "app_user_id": app_user_id,
+                    "error": str(exc),
+                },
+            )
+
+        # Fallback to analytics samples.
+        try:
+            if not sample_items:
+                samples = await archive_client.watch_history_analytics_samples(
+                    sec_user_id=sec_user_id,
+                    range=range_spec,
+                    time_zone=tz_map.get(app_user_id) or "UTC",
+                    strategy={"type": "recent"},
+                    limit=sample_limit,
+                    max_chars_per_item=350,
+                    fields=["title", "description", "hashtags", "music", "author"],
+                    include_video_id=False,
+                    include_watched_at=True,
+                )
+                raw_items = samples.get("items") if isinstance(samples, dict) else None
+                if isinstance(raw_items, list):
+                    sample_items = [it for it in raw_items if isinstance(it, dict)]
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_global_analyze.trend_samples_failed",
+                extra={
+                    "event": "weekly_report_global_analyze.trend_samples_failed",
+                    "global_report_id": global_report_id,
+                    "app_user_id": app_user_id,
+                    "error": str(exc),
+                },
+            )
+
+        # Fallback: use summary top creators/music to recover trend matching when samples are empty/unavailable.
+        if not sample_items:
+            try:
+                summary = await archive_client.watch_history_analytics_summary(
+                    sec_user_id=sec_user_id,
+                    range=range_spec,
+                    time_zone=tz_map.get(app_user_id) or "UTC",
+                    include_hour_histogram=False,
+                    top_creators_limit=8,
+                    top_music_limit=5,
+                )
+                fallback_items: List[Dict[str, Any]] = []
+                watched_at_iso = _iso_utc(week_end)
+                top_creators = summary.get("top_creators") if isinstance(summary, dict) else None
+                if isinstance(top_creators, list):
+                    for row in top_creators:
+                        if not isinstance(row, dict):
+                            continue
+                        author = _safe_str(row.get("author"))
+                        author_id = _safe_str(row.get("author_id"))
+                        if not author and not author_id:
+                            continue
+                        fallback_items.append(
+                            {
+                                "watched_at": watched_at_iso,
+                                "author": author,
+                                "author_id": author_id,
+                                "text": " ".join(v for v in [author, author_id] if v),
+                            }
+                        )
+                top_music = summary.get("top_music") if isinstance(summary, dict) else None
+                if isinstance(top_music, list):
+                    for row in top_music:
+                        if not isinstance(row, dict):
+                            continue
+                        music = _safe_str(row.get("music"))
+                        if not music:
+                            continue
+                        fallback_items.append(
+                            {
+                                "watched_at": watched_at_iso,
+                                "music": music,
+                                "text": music,
+                            }
+                        )
+                if fallback_items:
+                    sample_items = fallback_items
+                    logger.info(
+                        "weekly_report_global_analyze.trend_summary_fallback_used",
+                        extra={
+                            "event": "weekly_report_global_analyze.trend_summary_fallback_used",
+                            "global_report_id": global_report_id,
+                            "app_user_id": app_user_id,
+                            "item_count": len(fallback_items),
+                        },
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_global_analyze.trend_summary_fallback_failed",
+                    extra={
+                        "event": "weekly_report_global_analyze.trend_summary_fallback_failed",
+                        "global_report_id": global_report_id,
+                        "app_user_id": app_user_id,
+                        "error": str(exc),
+                    },
+                )
+
+        matches = _match_trends_for_samples(sample_items, candidates)
+        if not matches and llm_fallback_enabled and sample_items:
+            llm_key = await _llm_pick_trend_for_user(sample_items, candidates)
+            if llm_key:
+                earliest = min(
+                    (
+                        dt
+                        for dt in (
+                            _parse_watched_at_value(it.get("watched_at") or it.get("watchedAt"))
+                            for it in sample_items
+                        )
+                        if dt is not None
+                    ),
+                    default=None,
+                )
+                if earliest:
+                    matches = {llm_key: earliest}
+
+        user_matches[app_user_id] = matches
+        for trend_key, first_seen in matches.items():
+            trend_discoverers.setdefault(trend_key, []).append((app_user_id, first_seen))
+
+    total_users = len(user_reports)
+    trend_stats: Dict[str, Dict[str, Any]] = {}
+    penetration_start_hours = max(1.0, float(os.getenv("WEEKLY_TREND_PENETRATION_START_HOURS", "24")))
+    penetration_start_cutoff = week_start + timedelta(hours=penetration_start_hours)
+    for trend_key, discoverers in trend_discoverers.items():
+        candidate = candidate_map.get(trend_key)
+        if not candidate:
+            continue
+        discoverers_sorted = sorted(discoverers, key=lambda x: (x[1], x[0]))
+        discoverer_count = len(discoverers_sorted)
+        start_count = sum(1 for _uid, ts in discoverers_sorted if ts <= penetration_start_cutoff)
+        penetration_start = round((start_count / total_users) * 100.0, 2) if total_users > 0 else 0.0
+        penetration_end = round((discoverer_count / total_users) * 100.0, 2) if total_users > 0 else 0.0
+        trend_stats[trend_key] = {
+            "trend_type": candidate.trend_type,
+            "trend_name": candidate.trend_name,
+            "rank": candidate.rank,
+            "discoverers": discoverer_count,
+            "penetration_start_pct": penetration_start,
+            "penetration_end_pct": penetration_end,
+            "penetration_pct": penetration_end,
+            "discoverers_sorted": [(uid, _iso_utc(ts)) for uid, ts in discoverers_sorted],
+        }
+
+    top_penetration_key: Optional[str] = None
+    if trend_stats:
+        top_penetration_key = sorted(
+            trend_stats.items(),
+            key=lambda kv: (
+                -float(kv[1].get("penetration_pct") or 0.0),
+                int(kv[1].get("rank") or 9999),
+                kv[0],
+            ),
+        )[0][0]
+    elif candidates:
+        top_penetration_key = sorted(candidates, key=lambda c: (c.rank, c.key))[0].key
+
+    per_user: Dict[str, Dict[str, Any]] = {}
+    for report in user_reports:
+        app_user_id = _safe_str(report.app_user_id)
+        if not app_user_id:
+            continue
+        matches = user_matches.get(app_user_id) or {}
+        if matches:
+            sorted_user_matches = sorted(
+                matches.items(),
+                key=lambda kv: (kv[1], candidate_map.get(kv[0]).rank if candidate_map.get(kv[0]) else 9999),
+            )
+            chosen_key, first_seen = sorted_user_matches[0]
+            candidate = candidate_map.get(chosen_key)
+            stat = trend_stats.get(chosen_key, {})
+            discoverers_sorted = stat.get("discoverers_sorted") or []
+            rank = 0
+            for idx, row in enumerate(discoverers_sorted, start=1):
+                if isinstance(row, (list, tuple)) and row and row[0] == app_user_id:
+                    rank = idx
+                    break
+            total_discoverers = int(stat.get("discoverers") or len(discoverers_sorted) or 0)
+            if rank <= 0:
+                rank = 1
+            penetration_pct = float(stat.get("penetration_pct") or 0.0)
+            early_cutoff = max(1, int(math.ceil(total_discoverers * 0.4))) if total_discoverers > 0 else 1
+            variant = "early" if rank <= early_cutoff else "late"
+            if variant == "early":
+                origin = f"You were #{rank:,} to discover"
+                spread = f"out of {total_discoverers:,} people."
+            else:
+                origin = f"You joined at #{rank:,} out of {total_discoverers:,} people."
+                spread = "Fashionably late."
+            penetration_start = float(stat.get("penetration_start_pct") or 0.0)
+            penetration_end = float(stat.get("penetration_end_pct") or 0.0)
+            per_user[app_user_id] = {
+                "matched": True,
+                "variant": variant,
+                "trend_key": chosen_key,
+                "trend_type": candidate.trend_type if candidate else None,
+                "trend_name": candidate.trend_name if candidate else None,
+                "first_seen": _iso_utc(first_seen),
+                "discovery_rank": rank,
+                "total_discoverers": total_discoverers,
+                "penetration_pct": penetration_pct,
+                "reach_start": penetration_start,
+                "reach_end": penetration_end,
+                "current_reach": penetration_end,
+                "origin_niche_text": origin,
+                "spread_end_text": spread,
+            }
+            continue
+
+        fallback_candidate = candidate_map.get(top_penetration_key) if top_penetration_key else None
+        if fallback_candidate is None and candidates:
+            fallback_candidate = sorted(candidates, key=lambda c: (c.rank, c.key))[0]
+            top_penetration_key = fallback_candidate.key
+        fallback_stat = trend_stats.get(top_penetration_key, {}) if top_penetration_key else {}
+        fallback_penetration = float(fallback_stat.get("penetration_pct") or 0.0)
+        fallback_start = float(fallback_stat.get("penetration_start_pct") or 0.0)
+        fallback_end = float(fallback_stat.get("penetration_end_pct") or fallback_penetration)
+        if not fallback_stat and fallback_candidate:
+            if fallback_candidate.reach_start_hint is not None:
+                fallback_start = float(fallback_candidate.reach_start_hint)
+            if fallback_candidate.reach_end_hint is not None:
+                fallback_end = float(fallback_candidate.reach_end_hint)
+            if fallback_end < fallback_start:
+                fallback_end = fallback_start
+        per_user[app_user_id] = {
+            "matched": False,
+            "variant": "not_exposed",
+            "trend_key": top_penetration_key,
+            "trend_type": fallback_candidate.trend_type if fallback_candidate else None,
+            "trend_name": fallback_candidate.trend_name if fallback_candidate else None,
+            "first_seen": None,
+            "discovery_rank": None,
+            "total_discoverers": int(fallback_stat.get("discoverers") or 0),
+            "penetration_pct": fallback_penetration,
+            "reach_start": fallback_start,
+            "reach_end": fallback_end,
+            "current_reach": fallback_end,
+            "origin_niche_text": "This blew up but your feed missed it.",
+            "spread_end_text": "Your taste might be more niche than you think.",
+        }
+
+    return {
+        "enabled": True,
+        "version": 1,
+        "total_candidates": len(candidates),
+        "total_users": total_users,
+        "top_penetration_trend_key": top_penetration_key,
+        "per_user": per_user,
+        "trend_stats": trend_stats,
+    }
 
 
 def _extract_first_int(text: str) -> Optional[int]:
@@ -3273,353 +4285,6 @@ async def handle_email_send(job: LeasedJob) -> bool:
     return sent_ok
 
 
-async def handle_weekly_report_analyze(job: LeasedJob) -> bool:
-    """Analyze user's wrapped data and create/update weekly report."""
-    app_user_id = job.payload.get("app_user_id")
-    if not app_user_id:
-        return True
-    
-    with SessionLocal() as db:
-        user = db.get(AppUser, app_user_id)
-        if not user:
-            return True
-        if not user.latest_sec_user_id:
-            logger.warning(
-                "weekly_report_analyze.missing_sec_user_id",
-                extra={"event": "weekly_report_analyze.missing_sec_user_id", "app_user_id": app_user_id},
-            )
-            return True
-        
-        now = datetime.now(timezone.utc)
-        week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        week_end = week_start + timedelta(days=7)
-        window_end = min(week_end, now)
-
-        existing_report = (
-            db.query(WeeklyReport)
-            .filter(
-                WeeklyReport.app_user_id == app_user_id,
-                WeeklyReport.period_start.isnot(None),
-                WeeklyReport.period_start >= week_start,
-                WeeklyReport.period_start < week_end,
-            )
-            .order_by(WeeklyReport.updated_at.desc(), WeeklyReport.created_at.desc())
-            .first()
-        )
-        if not existing_report:
-            existing_report = (
-                db.query(WeeklyReport)
-                .filter(
-                    WeeklyReport.app_user_id == app_user_id,
-                    WeeklyReport.created_at >= week_start,
-                )
-                .order_by(WeeklyReport.updated_at.desc(), WeeklyReport.created_at.desc())
-                .first()
-            )
-        
-        if existing_report:
-            # Update existing report
-            report = existing_report
-        else:
-            # Create new report
-            report = WeeklyReport(
-                app_user_id=app_user_id,
-                send_status="pending",
-            )
-        
-        # 总结起止时间（周一 00:00 UTC 到下周一 00:00 UTC）
-        report.period_start = week_start
-        report.period_end = week_end
-
-        async def _coverage_ok() -> bool:
-            try:
-                coverage = await archive_client.watch_history_analytics_coverage(sec_user_id=user.latest_sec_user_id)
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_analyze.coverage_failed",
-                    extra={"event": "weekly_report_analyze.coverage_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-                return False
-            watched_min = _parse_iso_datetime(coverage.get("watched_at_min")) if isinstance(coverage, dict) else None
-            watched_max = _parse_iso_datetime(coverage.get("watched_at_max")) if isinstance(coverage, dict) else None
-            if not watched_min or not watched_max:
-                return False
-            grace_hours = float(os.getenv("WEEKLY_REPORT_COVERAGE_GRACE_HOURS", "0") or 0)
-            grace = timedelta(hours=max(0.0, grace_hours))
-            return watched_min <= week_start and watched_max >= (window_end - grace)
-
-        async def _fetch_until_week_start() -> None:
-            max_jobs = max(1, int(os.getenv("WEEKLY_REPORT_FETCH_MAX_DATA_JOBS", "8")))
-            cursor_ms = None
-            target_ms = int(week_start.timestamp() * 1000)
-            completed = 0
-            while completed < max_jobs:
-                start_resp = await archive_client.start_watch_history(
-                    sec_user_id=user.latest_sec_user_id,
-                    limit=WATCH_HISTORY_PAGE_LIMIT,
-                    max_pages=WATCH_HISTORY_MAX_PAGES,
-                    cursor=str(cursor_ms) if cursor_ms is not None else None,
-                )
-                if start_resp.status_code != 202:
-                    if start_resp.status_code in (400, 401, 403, 404):
-                        return
-                    await asyncio.sleep(1)
-                    continue
-                with suppress(Exception):
-                    start_data = start_resp.json()
-                data_job_id = start_data.get("data_job_id") if isinstance(start_data, dict) else None
-                if not data_job_id:
-                    return
-
-                fin_ok = False
-                fin_data: Dict[str, Any] = {}
-                backoff = 1.0
-                for _ in range(60):
-                    fin = await archive_client.finalize_watch_history(data_job_id=data_job_id, include_rows=False)
-                    if fin.status_code == 202:
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 8.0)
-                        continue
-                    if fin.status_code == 200:
-                        with suppress(Exception):
-                            fin_data = fin.json()
-                        fin_ok = True
-                    break
-
-                if not fin_ok:
-                    return
-
-                completed += 1
-                pagination = fin_data.get("pagination", {}) if isinstance(fin_data, dict) else {}
-                next_cursor = pagination.get("next_cursor")
-                has_more = pagination.get("has_more")
-                next_cursor_ms = None
-                with suppress(Exception):
-                    next_cursor_ms = int(next_cursor) if next_cursor is not None else None
-                if not next_cursor_ms or has_more is False or next_cursor_ms <= target_ms:
-                    return
-                cursor_ms = next_cursor_ms
-
-        # Try to fetch data if coverage is incomplete
-        coverage_complete = await _coverage_ok()
-        if not coverage_complete:
-            await _fetch_until_week_start()
-            coverage_complete = await _coverage_ok()
-        
-        # RELAXED: Even if coverage is incomplete, continue processing with available data
-        # This allows users with partial week data to still receive reports
-        if not coverage_complete:
-            logger.info(
-                "weekly_report_analyze.coverage_incomplete",
-                extra={"event": "weekly_report_analyze.coverage_incomplete", "app_user_id": app_user_id},
-            )
-            # Continue processing instead of returning early
-
-        range_spec: Dict[str, Any] = {"type": "between", "start_at": _iso_utc(week_start), "end_at": _iso_utc(window_end)}
-        summary: Optional[Dict[str, Any]] = None
-        try:
-            summary = await archive_client.watch_history_analytics_summary(
-                sec_user_id=user.latest_sec_user_id,
-                range=range_spec,
-                time_zone=user.time_zone or "UTC",
-                include_hour_histogram=False,
-                top_creators_limit=5,
-                top_music_limit=1,
-            )
-        except Exception as exc:
-            logger.warning(
-                "weekly_report_analyze.summary_failed",
-                extra={"event": "weekly_report_analyze.summary_failed", "app_user_id": app_user_id, "error": str(exc)},
-            )
-            return True
-
-        try:
-            totals = summary.get("totals") if isinstance(summary, dict) else None
-            total_videos = int(totals.get("videos") or 0) if isinstance(totals, dict) else 0
-            total_hours = float(totals.get("watch_hours") or 0.0) if isinstance(totals, dict) else 0.0
-        except Exception as exc:
-            logger.warning(
-                "weekly_report_analyze.summary_shape",
-                extra={"event": "weekly_report_analyze.summary_shape", "app_user_id": app_user_id, "error": str(exc)},
-            )
-            return True
-
-        report.total_videos = total_videos
-        report.total_time = int(round(total_hours * 3600))
-        report.timezone = user.time_zone or "UTC"
-
-        # Calculate miles_scrolled (estimate: ~3 inches per video swipe, converted to miles)
-        # 3 inches = 0.0000473485 miles, so videos * 0.0000473485
-        report.miles_scrolled = int(round(total_videos * 0.0000473485 * 1000))  # in 1/1000 miles for precision
-
-        # Get previous week's total_time for comparison
-        prev_week_start = week_start - timedelta(days=7)
-        prev_report = (
-            db.query(WeeklyReport)
-            .filter(
-                WeeklyReport.app_user_id == app_user_id,
-                WeeklyReport.period_start.isnot(None),
-                WeeklyReport.period_start >= prev_week_start,
-                WeeklyReport.period_start < week_start,
-            )
-            .order_by(WeeklyReport.created_at.desc())
-            .first()
-        )
-        if prev_report and prev_report.total_time:
-            report.pre_total_time = prev_report.total_time
-
-        # Fetch sample data for LLM analysis
-        sample_texts: List[str] = []
-        try:
-            samples = await archive_client.watch_history_analytics_samples(
-                sec_user_id=user.latest_sec_user_id,
-                range=range_spec,
-                time_zone=user.time_zone or "UTC",
-                strategy={"type": "recent"},
-                limit=50,
-                max_chars_per_item=300,
-                fields=["title", "description", "hashtags", "music", "author"],
-                include_video_id=False,
-                include_watched_at=False,
-            )
-            items = samples.get("items") if isinstance(samples, dict) else None
-            if isinstance(items, list):
-                sample_texts = [str(it.get("text") or "").strip() for it in items if isinstance(it, dict)]
-                sample_texts = [t for t in sample_texts if t]
-        except Exception as exc:
-            logger.warning(
-                "weekly_report_analyze.samples_failed",
-                extra={"event": "weekly_report_analyze.samples_failed", "app_user_id": app_user_id, "error": str(exc)},
-            )
-
-        # LLM analysis (only if we have sample data)
-        if sample_texts:
-            # 1. Feeding state analysis
-            try:
-                feeding_result = await _call_llm(WEEKLY_FEEDING_STATE_PROMPT, sample_texts, temperature=0.3)
-                feeding_state = feeding_result.strip().lower()
-                if feeding_state in ("curious", "excited", "cozy", "sleepy", "dizzy"):
-                    report.feeding_state = feeding_state
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_analyze.feeding_state_failed",
-                    extra={"event": "weekly_report_analyze.feeding_state_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-
-            # 2. Topics analysis
-            try:
-                topics_result = await _call_llm(WEEKLY_TOPICS_PROMPT, sample_texts, temperature=0.5)
-                topics_data = _extract_json_value(topics_result)
-                if isinstance(topics_data, list):
-                    # Add placeholder pic_url for now (can be filled by frontend)
-                    topics = []
-                    for item in topics_data[:3]:
-                        if isinstance(item, dict) and item.get("topic"):
-                            topics.append({"topic": str(item["topic"]), "pic_url": ""})
-                        elif isinstance(item, str):
-                            topics.append({"topic": item, "pic_url": ""})
-                    if topics:
-                        report.topics = topics
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_analyze.topics_failed",
-                    extra={"event": "weekly_report_analyze.topics_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-
-            # 3. Rabbit hole analysis
-            try:
-                rabbit_result = await _call_llm(WEEKLY_RABBIT_HOLE_PROMPT, sample_texts, temperature=0.3)
-                rabbit_data = _extract_json_value(rabbit_result)
-                if isinstance(rabbit_data, dict):
-                    category = rabbit_data.get("category")
-                    count = rabbit_data.get("count")
-                    if category and isinstance(category, str):
-                        report.rabbit_hole_category = category
-                        if isinstance(count, (int, float)):
-                            report.rabbit_hole_count = int(count)
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_analyze.rabbit_hole_failed",
-                    extra={"event": "weekly_report_analyze.rabbit_hole_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-
-            # 4. Nudge text analysis
-            try:
-                nudge_result = await _call_llm(WEEKLY_NUDGE_PROMPT, sample_texts, temperature=0.7)
-                nudge_text = nudge_result.strip()
-                if nudge_text and len(nudge_text) <= 80:
-                    report.nudge_text = nudge_text
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_analyze.nudge_failed",
-                    extra={"event": "weekly_report_analyze.nudge_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-
-        # Call external Node.js service to generate email HTML content.
-        node_url = (os.getenv("WEEKLY_REPORT_NODE_URL") or "").strip()
-        if node_url:
-            try:
-                # Build params with all WeeklyReport fields
-                node_params = {
-                    "period_start": _iso_utc(week_start) if week_start else None,
-                    "period_end": _iso_utc(week_end) if week_end else None,
-                    "timezone": report.timezone,
-                    "total_videos": report.total_videos,
-                    "total_time": report.total_time,
-                    "pre_total_time": report.pre_total_time,
-                    "miles_scrolled": report.miles_scrolled,
-                    "feeding_state": report.feeding_state,
-                    "topics": report.topics,
-                    "trend_name": report.trend_name,
-                    "trend_type": report.trend_type,
-                    "discovery_rank": report.discovery_rank,
-                    "total_discoverers": report.total_discoverers,
-                    "origin_niche_text": report.origin_niche_text,
-                    "spread_end_text": report.spread_end_text,
-                    "reach_start": report.reach_start,
-                    "reach_end": report.reach_end,
-                    "current_reach": report.current_reach,
-                    "rabbit_hole_datetime": _iso_utc(report.rabbit_hole_datetime) if report.rabbit_hole_datetime else None,
-                    "rabbit_hole_date": report.rabbit_hole_date,
-                    "rabbit_hole_time": report.rabbit_hole_time,
-                    "rabbit_hole_count": report.rabbit_hole_count,
-                    "rabbit_hole_category": report.rabbit_hole_category,
-                    "nudge_text": report.nudge_text,
-                }
-                # New API format: {"uid": app_user_id, "params": {...}}
-                node_payload = {
-                    "uid": app_user_id,
-                    "params": node_params,
-                }
-                headers = {"Content-Type": "application/json"}
-                node_token = (os.getenv("WEEKLY_REPORT_NODE_TOKEN") or "").strip()
-                if node_token:
-                    headers["Authorization"] = f"Bearer {node_token}"
-                resp = httpx.post(node_url, json=node_payload, headers=headers, timeout=30.0)
-                resp.raise_for_status()
-                with suppress(Exception):
-                    node_data = resp.json()
-                    # Response format: {"data": {}, "html": "..."}
-                    email_html = node_data.get("html") or node_data.get("email_content")
-                    if isinstance(email_html, str) and email_html.strip():
-                        report.email_content = email_html
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_analyze.node_failed",
-                    extra={"event": "weekly_report_analyze.node_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-
-        db.add(report)
-        db.commit()
-
-        logger.info(
-            "weekly_report_analyze.completed",
-            extra={"event": "weekly_report_analyze.completed", "app_user_id": app_user_id, "report_id": report.id},
-        )
-    
-    return True
-
-
 async def handle_weekly_report_send(job: LeasedJob) -> bool:
     """Send weekly report email to user.
     
@@ -3714,6 +4379,16 @@ async def handle_weekly_report_send(job: LeasedJob) -> bool:
     
     resp = _get_emailer().send_email(email_address, subject, text_body, html_body)
     sent_ok = resp is not None
+    if not sent_ok:
+        logger.warning(
+            "weekly_report_send.failed",
+            extra={
+                "event": "weekly_report_send.failed",
+                "app_user_id": app_user_id,
+                "report_id": report_id,
+                "email_address": email_address,
+            },
+        )
     
     # Update send status
     with SessionLocal() as db:
@@ -3786,53 +4461,134 @@ async def handle_weekly_report_fetch_trends(job: LeasedJob) -> bool:
     If TikTok Ads credentials are missing or API fails, we still enqueue weekly_report_batch_fetch
     so the rest of the pipeline runs without trend data.
     """
-    global_report_id = job.payload.get("global_report_id")
+    payload = job.payload or {}
+    global_report_id = payload.get("global_report_id")
     if not global_report_id:
         return True
+    force_refresh_trends = bool(payload.get("force_refresh_trends"))
+    skip_batch_fetch = bool(payload.get("skip_batch_fetch"))
 
     with SessionLocal() as db:
         global_report = db.get(WeeklyReportGlobal, global_report_id)
         if not global_report:
             return True
 
+        existing_hashtags = (
+            db.query(func.count(WeeklyTrendHashtag.id))
+            .filter(WeeklyTrendHashtag.global_report_id == global_report_id)
+            .scalar()
+            or 0
+        )
+        existing_sounds = (
+            db.query(func.count(WeeklyTrendSound.id))
+            .filter(WeeklyTrendSound.global_report_id == global_report_id)
+            .scalar()
+            or 0
+        )
+        existing_creators = (
+            db.query(func.count(WeeklyTrendCreator.id))
+            .filter(WeeklyTrendCreator.global_report_id == global_report_id)
+            .scalar()
+            or 0
+        )
+        existing_ready = existing_hashtags > 0 and existing_sounds > 0 and existing_creators > 0
+
+        if existing_ready and not force_refresh_trends:
+            logger.info(
+                "weekly_report_fetch_trends.skip_existing",
+                extra={
+                    "event": "weekly_report_fetch_trends.skip_existing",
+                    "global_report_id": global_report_id,
+                    "hashtags": existing_hashtags,
+                    "sounds": existing_sounds,
+                    "creators": existing_creators,
+                },
+            )
+            if not skip_batch_fetch:
+                batch_payload: Dict[str, Any] = {"global_report_id": global_report_id}
+                limit_to = payload.get("limit_to_app_user_ids")
+                if isinstance(limit_to, list) and limit_to:
+                    batch_payload["limit_to_app_user_ids"] = [str(u) for u in limit_to]
+                email_override = payload.get("email_override")
+                if isinstance(email_override, str) and email_override.strip():
+                    batch_payload["email_override"] = email_override.strip()
+                job_queue.enqueue(
+                    db,
+                    task_name="weekly_report_batch_fetch",
+                    payload=batch_payload,
+                    idempotency_key=f"weekly_report_batch_fetch:{global_report_id}",
+                )
+            return True
+
     cookie: Optional[str] = None
     user_sign: Optional[str] = None
     web_id: Optional[str] = None
-    headers_from_capture = False
+    creator_cookie: Optional[str] = None
+    creator_user_sign: Optional[str] = None
+    creator_web_id: Optional[str] = None
+    sound_cookie: Optional[str] = None
+    sound_user_sign: Optional[str] = None
+    sound_web_id: Optional[str] = None
+    hashtag_cookie: Optional[str] = None
+    hashtag_user_sign: Optional[str] = None
+    hashtag_web_id: Optional[str] = None
+    country_code = getattr(settings, "tiktok_ads_country_code", "US") or "US"
+    headers_source = "anonymous"
+    header_config_id: Optional[int] = None
+    header_config_updated_at: Optional[str] = None
 
-    # In-process capture: if SESSION_DIR is set, get headers via Playwright *here* before calling the API (no separate script run per fetch)
-    session_dir = getattr(settings, "tiktok_ads_session_dir", None) or os.getenv("TIKTOK_ADS_SESSION_DIR")
-    if session_dir and session_dir.strip():
-        session_dir = session_dir.strip()
-        try:
-            captured = await capture_tiktok_radar_headers(session_dir)
-            if captured:
-                cookie, user_sign, web_id = captured
-                headers_from_capture = True
-                logger.info(
-                    "weekly_report_fetch_trends.headers_captured",
-                    extra={"event": "weekly_report_fetch_trends.headers_captured", "global_report_id": global_report_id},
-                )
-        except Exception as exc:
-            logger.warning(
-                "weekly_report_fetch_trends.capture_failed",
-                extra={"event": "weekly_report_fetch_trends.capture_failed", "global_report_id": global_report_id, "error": str(exc)},
-            )
+    with SessionLocal() as db:
+        cfg = (
+            db.query(TikTokRadarHeaderConfig)
+            .order_by(TikTokRadarHeaderConfig.updated_at.desc(), TikTokRadarHeaderConfig.id.desc())
+            .first()
+        )
+        if cfg:
+            header_config_id = cfg.id
+            header_config_updated_at = cfg.updated_at.isoformat() if cfg.updated_at else None
+            cookie = (cfg.cookie or "").strip() or None
+            user_sign = (cfg.user_sign or "").strip() or None
+            web_id = (cfg.web_id or "").strip() or None
+            creator_cookie = (cfg.creator_cookie or "").strip() or None
+            creator_user_sign = (cfg.creator_user_sign or "").strip() or None
+            creator_web_id = (cfg.creator_web_id or "").strip() or None
+            sound_cookie = (cfg.sound_cookie or "").strip() or None
+            sound_user_sign = (cfg.sound_user_sign or "").strip() or None
+            sound_web_id = (cfg.sound_web_id or "").strip() or None
+            hashtag_cookie = (cfg.hashtag_cookie or "").strip() or None
+            hashtag_user_sign = (cfg.hashtag_user_sign or "").strip() or None
+            hashtag_web_id = (cfg.hashtag_web_id or "").strip() or None
+            if cfg.country_code:
+                country_code = str(cfg.country_code).strip().upper() or country_code
+            if cookie and user_sign and web_id:
+                headers_source = "db"
 
     if not (cookie and user_sign and web_id):
         cookie = getattr(settings, "tiktok_ads_cookie", None) or os.getenv("TIKTOK_ADS_COOKIE")
         user_sign = getattr(settings, "tiktok_ads_user_sign", None) or os.getenv("TIKTOK_ADS_USER_SIGN")
         web_id = getattr(settings, "tiktok_ads_web_id", None) or os.getenv("TIKTOK_ADS_WEB_ID")
-    country_code = getattr(settings, "tiktok_ads_country_code", "US") or "US"
+        headers_source = "env" if (cookie or user_sign or web_id) else "anonymous"
 
-    headers_source = "captured" if headers_from_capture else ("env" if (cookie or user_sign or web_id) else "anonymous")
     logger.info(
         "weekly_report_fetch_trends.headers_source",
         extra={
             "event": "weekly_report_fetch_trends.headers_source",
             "global_report_id": global_report_id,
             "headers_source": headers_source,
-            "session_dir_configured": bool(session_dir and str(session_dir).strip()),
+            "header_config_id": header_config_id,
+            "header_config_updated_at": header_config_updated_at,
+            "has_cookie": bool(cookie),
+            "has_user_sign": bool(user_sign),
+            "has_web_id": bool(web_id),
+            "cookie_len": len(cookie or ""),
+            "user_sign_suffix": (user_sign[-6:] if user_sign else None),
+            "web_id_suffix": (web_id[-6:] if web_id else None),
+            "cookie_has_sessionid_ads": ("sessionid_ads=" in (cookie or "")),
+            "cookie_has_sid_tt_ads": ("sid_tt_ads=" in (cookie or "")),
+            "has_creator_headers": bool(creator_cookie and creator_user_sign and creator_web_id),
+            "has_sound_headers": bool(sound_cookie and sound_user_sign and sound_web_id),
+            "has_hashtag_headers": bool(hashtag_cookie and hashtag_user_sign and hashtag_web_id),
+            "country_code": country_code,
         },
     )
 
@@ -3841,118 +4597,156 @@ async def handle_weekly_report_fetch_trends(job: LeasedJob) -> bool:
         cookie=cookie or None,
         user_sign=user_sign or None,
         web_id=web_id or None,
+        creator_cookie=creator_cookie,
+        creator_user_sign=creator_user_sign,
+        creator_web_id=creator_web_id,
+        sound_cookie=sound_cookie,
+        sound_user_sign=sound_user_sign,
+        sound_web_id=sound_web_id,
+        hashtag_cookie=hashtag_cookie,
+        hashtag_user_sign=hashtag_user_sign,
+        hashtag_web_id=hashtag_web_id,
         country_code=country_code,
     )
-    try:
-        creators = await client.fetch_all_creators()
-        sounds = await client.fetch_all_sounds()
-        hashtags = await client.fetch_all_hashtags()
-    except TikTokCreativeRadarError as exc:
-        resp = getattr(exc, "response", None) or {}
-        logger.warning(
-            "weekly_report_fetch_trends.api_error",
+    creators: List[Dict[str, Any]] = []
+    sounds: List[Dict[str, Any]] = []
+    hashtags: List[Dict[str, Any]] = []
+    for trend_type, fetch_fn in (
+        ("creator", client.fetch_all_creators),
+        ("sound", client.fetch_all_sounds),
+        ("hashtag", client.fetch_all_hashtags),
+    ):
+        try:
+            data = await fetch_fn()
+            if trend_type == "creator":
+                creators = data
+            elif trend_type == "sound":
+                sounds = data
+            else:
+                hashtags = data
+        except TikTokCreativeRadarError as exc:
+            resp = getattr(exc, "response", None) or {}
+            logger.warning(
+                "weekly_report_fetch_trends.api_error",
                 extra={
                     "event": "weekly_report_fetch_trends.api_error",
                     "global_report_id": global_report_id,
+                    "trend_type": trend_type,
                     "error": str(exc),
                     "code": getattr(exc, "code", None),
                     "api_msg": resp.get("msg") if isinstance(resp, dict) else None,
                 },
-        )
-        creators, sounds, hashtags = [], [], []
-    except Exception as exc:
-        logger.warning(
-            "weekly_report_fetch_trends.fetch_failed",
-            extra={
-                "event": "weekly_report_fetch_trends.fetch_failed",
-                "global_report_id": global_report_id,
-                "error": str(exc),
-            },
-        )
-        creators, sounds, hashtags = [], [], []
-    finally:
-        await client.close()
+            )
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_fetch_trends.fetch_failed",
+                extra={
+                    "event": "weekly_report_fetch_trends.fetch_failed",
+                    "global_report_id": global_report_id,
+                    "trend_type": trend_type,
+                    "error": str(exc),
+                },
+            )
+    fetch_has_data = bool(creators or sounds or hashtags)
+    await client.close()
 
     with SessionLocal() as db:
-        # Idempotent: delete existing trend rows for this week, then insert
-        db.query(WeeklyTrendHashtag).filter(WeeklyTrendHashtag.global_report_id == global_report_id).delete()
-        db.query(WeeklyTrendSound).filter(WeeklyTrendSound.global_report_id == global_report_id).delete()
-        db.query(WeeklyTrendCreator).filter(WeeklyTrendCreator.global_report_id == global_report_id).delete()
+        if fetch_has_data:
+            global_report = db.get(WeeklyReportGlobal, global_report_id)
+            period_start = global_report.period_start if global_report else None
+            period_end = global_report.period_end if global_report else None
 
-        for rank, h in enumerate(hashtags, start=1):
-            country_info = h.get("country_info") or {}
-            country_code_val = country_info.get("id") if isinstance(country_info, dict) else h.get("country_code")
-            row = WeeklyTrendHashtag(
-                global_report_id=global_report_id,
-                rank=rank,
-                hashtag_id=str(h.get("hashtag_id") or ""),
-                hashtag_name=h.get("hashtag_name"),
-                country_code=country_code_val or h.get("country_code"),
-                publish_cnt=int(h.get("publish_cnt") or 0) if h.get("publish_cnt") is not None else None,
-                video_views=int(h.get("video_views") or 0) if h.get("video_views") is not None else None,
-                rank_diff=int(h.get("rank_diff")) if h.get("rank_diff") is not None else None,
-                rank_diff_type=int(h.get("rank_diff_type")) if h.get("rank_diff_type") is not None else None,
-                trend=h.get("trend"),
-                industry_info=h.get("industry_info"),
+            # Idempotent refresh: replace existing trend rows for this week.
+            db.query(WeeklyTrendHashtag).filter(WeeklyTrendHashtag.global_report_id == global_report_id).delete()
+            db.query(WeeklyTrendSound).filter(WeeklyTrendSound.global_report_id == global_report_id).delete()
+            db.query(WeeklyTrendCreator).filter(WeeklyTrendCreator.global_report_id == global_report_id).delete()
+
+            for rank, h in enumerate(hashtags, start=1):
+                country_info = h.get("country_info") or {}
+                country_code_val = country_info.get("id") if isinstance(country_info, dict) else h.get("country_code")
+                row = WeeklyTrendHashtag(
+                    global_report_id=global_report_id,
+                    period_start=period_start,
+                    period_end=period_end,
+                    rank=rank,
+                    hashtag_id=str(h.get("hashtag_id") or ""),
+                    hashtag_name=h.get("hashtag_name"),
+                    country_code=country_code_val or h.get("country_code"),
+                    publish_cnt=int(h.get("publish_cnt") or 0) if h.get("publish_cnt") is not None else None,
+                    video_views=int(h.get("video_views") or 0) if h.get("video_views") is not None else None,
+                    rank_diff=int(h.get("rank_diff")) if h.get("rank_diff") is not None else None,
+                    rank_diff_type=int(h.get("rank_diff_type")) if h.get("rank_diff_type") is not None else None,
+                    trend=h.get("trend"),
+                    industry_info=h.get("industry_info"),
+                )
+                db.add(row)
+
+            for rank, s in enumerate(sounds, start=1):
+                row = WeeklyTrendSound(
+                    global_report_id=global_report_id,
+                    period_start=period_start,
+                    period_end=period_end,
+                    rank=rank,
+                    clip_id=str(s.get("clip_id") or ""),
+                    song_id=str(s.get("song_id") or ""),
+                    title=s.get("title"),
+                    author=s.get("author"),
+                    country_code=s.get("country_code"),
+                    duration=int(s.get("duration")) if s.get("duration") is not None else None,
+                    link=s.get("link"),
+                    trend=s.get("trend"),
+                )
+                db.add(row)
+
+            for rank, c in enumerate(creators, start=1):
+                row = WeeklyTrendCreator(
+                    global_report_id=global_report_id,
+                    period_start=period_start,
+                    period_end=period_end,
+                    rank=rank,
+                    tcm_id=str(c.get("tcm_id") or ""),
+                    user_id=str(c.get("user_id") or ""),
+                    nick_name=c.get("nick_name"),
+                    avatar_url=c.get("avatar_url"),
+                    country_code=c.get("country_code"),
+                    follower_cnt=int(c.get("follower_cnt")) if c.get("follower_cnt") is not None else None,
+                    liked_cnt=int(c.get("liked_cnt")) if c.get("liked_cnt") is not None else None,
+                    tt_link=c.get("tt_link"),
+                    items=c.get("items"),
+                )
+                db.add(row)
+
+            db.commit()
+            logger.info(
+                "weekly_report_fetch_trends.saved",
+                extra={
+                    "event": "weekly_report_fetch_trends.saved",
+                    "global_report_id": global_report_id,
+                    "hashtags": len(hashtags),
+                    "sounds": len(sounds),
+                    "creators": len(creators),
+                },
             )
-            db.add(row)
-
-        for rank, s in enumerate(sounds, start=1):
-            row = WeeklyTrendSound(
-                global_report_id=global_report_id,
-                rank=rank,
-                clip_id=str(s.get("clip_id") or ""),
-                song_id=str(s.get("song_id") or ""),
-                title=s.get("title"),
-                author=s.get("author"),
-                country_code=s.get("country_code"),
-                duration=int(s.get("duration")) if s.get("duration") is not None else None,
-                link=s.get("link"),
-                trend=s.get("trend"),
+        else:
+            logger.warning(
+                "weekly_report_fetch_trends.no_data_keep_existing",
+                extra={"event": "weekly_report_fetch_trends.no_data_keep_existing", "global_report_id": global_report_id},
             )
-            db.add(row)
 
-        for rank, c in enumerate(creators, start=1):
-            row = WeeklyTrendCreator(
-                global_report_id=global_report_id,
-                rank=rank,
-                tcm_id=str(c.get("tcm_id") or ""),
-                user_id=str(c.get("user_id") or ""),
-                nick_name=c.get("nick_name"),
-                avatar_url=c.get("avatar_url"),
-                country_code=c.get("country_code"),
-                follower_cnt=int(c.get("follower_cnt")) if c.get("follower_cnt") is not None else None,
-                liked_cnt=int(c.get("liked_cnt")) if c.get("liked_cnt") is not None else None,
-                tt_link=c.get("tt_link"),
-                items=c.get("items"),
+        if not skip_batch_fetch:
+            batch_payload: Dict[str, Any] = {"global_report_id": global_report_id}
+            limit_to = payload.get("limit_to_app_user_ids")
+            if isinstance(limit_to, list) and limit_to:
+                batch_payload["limit_to_app_user_ids"] = [str(u) for u in limit_to]
+            email_override = payload.get("email_override")
+            if isinstance(email_override, str) and email_override.strip():
+                batch_payload["email_override"] = email_override.strip()
+            job_queue.enqueue(
+                db,
+                task_name="weekly_report_batch_fetch",
+                payload=batch_payload,
+                idempotency_key=f"weekly_report_batch_fetch:{global_report_id}",
             )
-            db.add(row)
-
-        db.commit()
-        logger.info(
-            "weekly_report_fetch_trends.saved",
-            extra={
-                "event": "weekly_report_fetch_trends.saved",
-                "global_report_id": global_report_id,
-                "hashtags": len(hashtags),
-                "sounds": len(sounds),
-                "creators": len(creators),
-            },
-        )
-
-        batch_payload: Dict[str, Any] = {"global_report_id": global_report_id}
-        limit_to = job.payload.get("limit_to_app_user_ids")
-        if isinstance(limit_to, list) and limit_to:
-            batch_payload["limit_to_app_user_ids"] = [str(u) for u in limit_to]
-        email_override = job.payload.get("email_override")
-        if isinstance(email_override, str) and email_override.strip():
-            batch_payload["email_override"] = email_override.strip()
-        job_queue.enqueue(
-            db,
-            task_name="weekly_report_batch_fetch",
-            payload=batch_payload,
-            idempotency_key=f"weekly_report_batch_fetch:{global_report_id}",
-        )
     return True
 
 
@@ -4055,22 +4849,33 @@ async def handle_weekly_report_batch_fetch(job: LeasedJob) -> bool:
                         analyze_status="pending",
                     )
 
-            report.fetch_status = "pending"
+            # If already fetched for this global_report, keep it fetched to avoid
+            # re-entering pending state when enqueue dedups to an already succeeded job.
+            already_fetched = report.fetch_status == "fetched"
+            if not already_fetched:
+                report.fetch_status = "pending"
             db.add(report)
             db.commit()
             db.refresh(report)
 
-            # Enqueue fetch job
-            job_queue.enqueue(
-                db,
-                task_name="weekly_report_user_fetch",
-                payload={
-                    "app_user_id": user.app_user_id,
-                    "report_id": report.id,
-                    "global_report_id": global_report_id,
-                },
-                idempotency_key=f"weekly_report_user_fetch:{global_report_id}:{user.app_user_id}",
-            )
+            # Enqueue fetch job only when current report still needs fetching.
+            if not already_fetched:
+                queued_fetch_job = job_queue.enqueue(
+                    db,
+                    task_name="weekly_report_user_fetch",
+                    payload={
+                        "app_user_id": user.app_user_id,
+                        "report_id": report.id,
+                        "global_report_id": global_report_id,
+                    },
+                    idempotency_key=f"weekly_report_user_fetch:{global_report_id}:{user.app_user_id}",
+                )
+                if queued_fetch_job.status == "succeeded":
+                    # Dedup can return a historical succeeded job; keep report state consistent
+                    # so batch_fetch polling can move forward.
+                    report.fetch_status = "fetched"
+                    db.add(report)
+                    db.commit()
 
         global_report.total_users = len(users)
         db.add(global_report)
@@ -4215,16 +5020,36 @@ async def handle_weekly_report_user_fetch(job: LeasedJob) -> bool:
         async def _fetch_until_week_start() -> None:
             """Fetch watch history data until we cover week_start."""
             max_jobs = max(1, int(os.getenv("WEEKLY_REPORT_FETCH_MAX_DATA_JOBS", "8")))
+            max_network_errors = max(1, int(os.getenv("WEEKLY_REPORT_FETCH_MAX_NETWORK_ERRORS", "6")))
             cursor_ms = None
             target_ms = int(week_start.timestamp() * 1000)
             completed = 0
+            network_errors = 0
             while completed < max_jobs:
-                start_resp = await archive_client.start_watch_history(
-                    sec_user_id=user.latest_sec_user_id,
-                    limit=WATCH_HISTORY_PAGE_LIMIT,
-                    max_pages=WATCH_HISTORY_MAX_PAGES,
-                    cursor=str(cursor_ms) if cursor_ms is not None else None,
-                )
+                try:
+                    start_resp = await archive_client.start_watch_history(
+                        sec_user_id=user.latest_sec_user_id,
+                        limit=WATCH_HISTORY_PAGE_LIMIT,
+                        max_pages=WATCH_HISTORY_MAX_PAGES,
+                        cursor=str(cursor_ms) if cursor_ms is not None else None,
+                    )
+                except Exception as exc:
+                    network_errors += 1
+                    logger.warning(
+                        "weekly_report_user_fetch.start_failed",
+                        extra={
+                            "event": "weekly_report_user_fetch.start_failed",
+                            "app_user_id": app_user_id,
+                            "report_id": report_id,
+                            "error": str(exc),
+                            "network_errors": network_errors,
+                        },
+                    )
+                    if network_errors >= max_network_errors:
+                        return
+                    await asyncio.sleep(min(8.0, float(network_errors)))
+                    continue
+                network_errors = 0
                 if start_resp.status_code != 202:
                     if start_resp.status_code in (400, 401, 403, 404):
                         return
@@ -4239,8 +5064,28 @@ async def handle_weekly_report_user_fetch(job: LeasedJob) -> bool:
                 fin_ok = False
                 fin_data: Dict[str, Any] = {}
                 backoff = 1.0
+                fin_network_errors = 0
                 for _ in range(60):
-                    fin = await archive_client.finalize_watch_history(data_job_id=data_job_id, include_rows=False)
+                    try:
+                        fin = await archive_client.finalize_watch_history(data_job_id=data_job_id, include_rows=False)
+                    except Exception as exc:
+                        fin_network_errors += 1
+                        logger.warning(
+                            "weekly_report_user_fetch.finalize_failed",
+                            extra={
+                                "event": "weekly_report_user_fetch.finalize_failed",
+                                "app_user_id": app_user_id,
+                                "report_id": report_id,
+                                "error": str(exc),
+                                "data_job_id": data_job_id,
+                                "network_errors": fin_network_errors,
+                            },
+                        )
+                        if fin_network_errors >= max_network_errors:
+                            break
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 8.0)
+                        continue
                     if fin.status_code == 202:
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 8.0)
@@ -4340,30 +5185,48 @@ async def handle_weekly_report_global_analyze(job: LeasedJob) -> bool:
         
         # Calculate aggregate statistics
         total_videos = 0
-        total_time_seconds = 0
+        total_time_minutes = 0
         fetched_users = len(user_reports)
         
         for report in user_reports:
             if report.total_videos:
                 total_videos += report.total_videos
-            if report.total_time:
-                total_time_seconds += report.total_time
+            total_time_minutes += _total_time_to_minutes(report.total_time)
+
+        total_watch_hours = total_time_minutes / 60.0 if total_time_minutes > 0 else 0.0
         
-        total_watch_hours = total_time_seconds / 3600.0 if total_time_seconds > 0 else 0.0
-        
-        # TODO: Implement actual global analysis logic here
-        # This is a placeholder - can add:
-        # - Average watch time per user
-        # - Global trending topics
-        # - User percentile calculations
-        # - Cross-user pattern detection
+        week_start = _ensure_utc(global_report.period_start) or _get_week_boundaries()[0]
+        week_end = _ensure_utc(global_report.period_end) or _get_week_boundaries()[1]
+        now = datetime.now(timezone.utc)
+        window_end = min(week_end, now)
+
+        trend_discovery: Dict[str, Any] = {}
+        try:
+            trend_discovery = await _compute_weekly_trend_discovery(
+                db,
+                global_report_id=global_report_id,
+                user_reports=user_reports,
+                week_start=week_start,
+                week_end=window_end,
+            )
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_global_analyze.trend_discovery_failed",
+                extra={
+                    "event": "weekly_report_global_analyze.trend_discovery_failed",
+                    "global_report_id": global_report_id,
+                    "error": str(exc),
+                },
+            )
+            trend_discovery = {"enabled": False, "reason": "exception", "per_user": {}, "trend_stats": {}}
+
         analysis_result = {
             "fetched_users": fetched_users,
             "total_videos": total_videos,
             "total_watch_hours": round(total_watch_hours, 2),
             "avg_videos_per_user": round(total_videos / fetched_users, 2) if fetched_users > 0 else 0,
             "avg_watch_hours_per_user": round(total_watch_hours / fetched_users, 2) if fetched_users > 0 else 0,
-            # Placeholder for future analysis fields
+            "trend_discovery": trend_discovery,
             "trending_topics": [],
             "global_patterns": {},
         }
@@ -4423,14 +5286,16 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
             return True
         
         # Get all user reports that were fetched
-        user_reports = (
+        user_reports_query = (
             db.query(WeeklyReport)
             .filter(
                 WeeklyReport.global_report_id == global_report_id,
                 WeeklyReport.fetch_status == "fetched",
             )
-            .all()
         )
+        if isinstance(limit_to_app_user_ids, list) and limit_to_app_user_ids:
+            user_reports_query = user_reports_query.filter(WeeklyReport.app_user_id.in_(limit_to_app_user_ids))
+        user_reports = user_reports_query.all()
         
         if not user_reports:
             logger.info(
@@ -4450,7 +5315,7 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
             report.analyze_status = "pending"
             db.add(report)
             
-            job_queue.enqueue(
+            queued_analyze_job = job_queue.enqueue(
                 db,
                 task_name="weekly_report_user_analyze",
                 payload={
@@ -4460,7 +5325,11 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
                 },
                 idempotency_key=f"weekly_report_user_analyze:{global_report_id}:{report.app_user_id}",
             )
-        
+            if queued_analyze_job.status == "succeeded":
+                # Dedup can return historical success; keep status consistent for polling.
+                report.analyze_status = "analyzed"
+                db.add(report)
+
         db.commit()
         
         logger.info(
@@ -4482,14 +5351,16 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
         
         with SessionLocal() as db:
             # Check how many reports are still analyzing
-            pending_count = (
+            pending_count_query = (
                 db.query(func.count(WeeklyReport.id))
                 .filter(
                     WeeklyReport.global_report_id == global_report_id,
                     WeeklyReport.analyze_status.in_(["pending", "analyzing"]),
                 )
-                .scalar()
             )
+            if isinstance(limit_to_app_user_ids, list) and limit_to_app_user_ids:
+                pending_count_query = pending_count_query.filter(WeeklyReport.app_user_id.in_(limit_to_app_user_ids))
+            pending_count = pending_count_query.scalar()
             
             if pending_count == 0:
                 logger.info(
@@ -4541,11 +5412,6 @@ async def handle_weekly_report_batch_analyze(job: LeasedJob) -> bool:
 
 async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
     """Analyze a single user's data, generate HTML, and save to DB.
-    
-    This is similar to the original handle_weekly_report_analyze but:
-    - Uses existing fetched data (no re-fetching)
-    - Can access global analysis results from WeeklyReportGlobal
-    - Updates analyze_status instead of doing everything in one go
     """
     app_user_id = job.payload.get("app_user_id")
     report_id = job.payload.get("report_id")
@@ -4553,22 +5419,27 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
     
     if not app_user_id or not report_id:
         return True
-    
+
     with SessionLocal() as db:
+        report = db.get(WeeklyReport, report_id)
+        if not report:
+            return True
         user = db.get(AppUser, app_user_id)
         if not user:
+            report.analyze_status = "failed"
+            db.add(report)
+            db.commit()
             return True
         if not user.latest_sec_user_id:
             logger.warning(
                 "weekly_report_user_analyze.missing_sec_user_id",
                 extra={"event": "weekly_report_user_analyze.missing_sec_user_id", "app_user_id": app_user_id},
             )
+            report.analyze_status = "failed"
+            db.add(report)
+            db.commit()
             return True
-        
-        report = db.get(WeeklyReport, report_id)
-        if not report:
-            return True
-        
+
         # Mark as analyzing
         report.analyze_status = "analyzing"
         db.add(report)
@@ -4590,8 +5461,9 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
         
         now = datetime.now(timezone.utc)
         window_end = min(week_end, now)
-        
-        range_spec: Dict[str, Any] = {"type": "between", "start_at": _iso_utc(week_start), "end_at": _iso_utc(window_end)}
+        analysis_start = week_start
+        analysis_end = window_end
+        range_spec: Dict[str, Any] = {"type": "between", "start_at": _iso_utc(analysis_start), "end_at": _iso_utc(analysis_end)}
         summary: Optional[Dict[str, Any]] = None
         
         try:
@@ -4626,13 +5498,129 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
             db.add(report)
             db.commit()
             return True
+
+        # Pull raw watch-history rows so single-user test runs still have enough signals
+        # for topics/rabbit-hole extraction.
+        baseline_start = analysis_start - timedelta(days=28)
+        history_rows: List[Dict[str, Any]] = []
+        try:
+            history_rows = await _fetch_watch_history_rows_for_range(
+                sec_user_id=user.latest_sec_user_id,
+                start_at=baseline_start,
+                end_at=analysis_end,
+                max_pages=WEEKLY_REPORT_HISTORY_MAX_PAGES,
+                page_limit=WEEKLY_REPORT_HISTORY_PAGE_LIMIT,
+            )
+        except Exception as exc:
+            logger.warning(
+                "weekly_report_user_analyze.watch_history_rows_failed",
+                extra={"event": "weekly_report_user_analyze.watch_history_rows_failed", "app_user_id": app_user_id, "error": str(exc)},
+            )
+
+        weekly_rows: List[Dict[str, Any]] = []
+        for row in history_rows:
+            watched_at = _parse_watched_at_value(row.get("watched_at")) if isinstance(row, dict) else None
+            if watched_at and analysis_start <= watched_at < analysis_end:
+                weekly_rows.append(row)
+        if total_videos <= 0 and weekly_rows:
+            total_videos = len(weekly_rows)
+        if total_hours <= 0.0 and weekly_rows:
+            duration_ms = 0.0
+            for row in weekly_rows:
+                with suppress(Exception):
+                    duration_ms += float(row.get("duration_ms") or 0.0)
+            if duration_ms > 0:
+                total_hours = duration_ms / 1000.0 / 3600.0
+
+        # If this week's window has no data, fallback to latest available 7-day window.
+        fallback_on_empty = os.getenv("WEEKLY_REPORT_ACTIVITY_FALLBACK_ON_EMPTY", "true").lower() in ("1", "true", "yes", "on")
+        if fallback_on_empty and total_videos <= 0 and total_hours <= 0.0 and not weekly_rows:
+            latest_watched_at = await _fetch_latest_watched_at(user.latest_sec_user_id)
+            if latest_watched_at:
+                fb_end = min(latest_watched_at, now)
+                fb_start = fb_end - timedelta(days=7)
+                if fb_end > fb_start:
+                    fb_range = {"type": "between", "start_at": _iso_utc(fb_start), "end_at": _iso_utc(fb_end)}
+                    with suppress(Exception):
+                        fb_summary = await archive_client.watch_history_analytics_summary(
+                            sec_user_id=user.latest_sec_user_id,
+                            range=fb_range,
+                            time_zone=user.time_zone or "UTC",
+                            include_hour_histogram=False,
+                            top_creators_limit=5,
+                            top_music_limit=1,
+                        )
+                        fb_totals = fb_summary.get("totals") if isinstance(fb_summary, dict) else None
+                        if isinstance(fb_totals, dict):
+                            total_videos = int(fb_totals.get("videos") or 0)
+                            total_hours = float(fb_totals.get("watch_hours") or 0.0)
+                    with suppress(Exception):
+                        history_rows = await _fetch_watch_history_rows_for_range(
+                            sec_user_id=user.latest_sec_user_id,
+                            start_at=fb_start - timedelta(days=28),
+                            end_at=fb_end,
+                            max_pages=WEEKLY_REPORT_HISTORY_MAX_PAGES,
+                            page_limit=WEEKLY_REPORT_HISTORY_PAGE_LIMIT,
+                        )
+                    analysis_start = fb_start
+                    analysis_end = fb_end
+                    baseline_start = analysis_start - timedelta(days=28)
+                    range_spec = {"type": "between", "start_at": _iso_utc(analysis_start), "end_at": _iso_utc(analysis_end)}
+                    weekly_rows = []
+                    for row in history_rows:
+                        watched_at = _parse_watched_at_value(row.get("watched_at")) if isinstance(row, dict) else None
+                        if watched_at and analysis_start <= watched_at < analysis_end:
+                            weekly_rows.append(row)
+                    if total_videos <= 0 and weekly_rows:
+                        total_videos = len(weekly_rows)
+                    if total_hours <= 0.0 and weekly_rows:
+                        duration_ms = 0.0
+                        for row in weekly_rows:
+                            with suppress(Exception):
+                                duration_ms += float(row.get("duration_ms") or 0.0)
+                        if duration_ms > 0:
+                            total_hours = duration_ms / 1000.0 / 3600.0
+                    logger.info(
+                        "weekly_report_user_analyze.empty_week_fallback_applied",
+                        extra={
+                            "event": "weekly_report_user_analyze.empty_week_fallback_applied",
+                            "app_user_id": app_user_id,
+                            "fallback_start": _iso_utc(analysis_start),
+                            "fallback_end": _iso_utc(analysis_end),
+                            "fallback_rows_in_window": len(weekly_rows),
+                            "fallback_total_videos": int(total_videos or 0),
+                            "fallback_total_hours": float(total_hours or 0.0),
+                        },
+                    )
+        logger.info(
+            "weekly_report_user_analyze.volume_resolution",
+            extra={
+                "event": "weekly_report_user_analyze.volume_resolution",
+                "app_user_id": app_user_id,
+                "summary_total_videos": int(totals.get("videos") or 0) if isinstance(totals, dict) else 0,
+                "summary_total_hours": float(totals.get("watch_hours") or 0.0) if isinstance(totals, dict) else 0.0,
+                "history_rows_in_window": len(weekly_rows),
+                "resolved_total_videos": int(total_videos or 0),
+                "resolved_total_hours": float(total_hours or 0.0),
+                "period_start": _iso_utc(week_start),
+                "period_end": _iso_utc(window_end),
+                "analysis_start": _iso_utc(analysis_start),
+                "analysis_end": _iso_utc(analysis_end),
+            },
+        )
         
         report.total_videos = total_videos
-        report.total_time = int(round(total_hours * 3600))
+        # weekly_report.total_time is stored in minutes.
+        report.total_time = int(round(total_hours * 60))
         report.timezone = user.time_zone or "UTC"
-        
-        # Calculate miles_scrolled (estimate: ~3 inches per video swipe, converted to miles)
-        report.miles_scrolled = int(round(total_videos * 0.0000473485 * 1000))
+
+        # Keep weekly-report mile logic aligned with wrapped "thumb roast" logic.
+        videos_per_mile = 180.0
+        with suppress(Exception):
+            videos_per_mile = float(os.getenv("THUMB_VIDEOS_PER_MILE", "180"))
+        videos_per_mile = max(10.0, min(videos_per_mile, 10000.0))
+        miles = int(round((total_videos or 0) / videos_per_mile)) if total_videos else 0
+        report.miles_scrolled = miles if miles > 0 else (1 if total_videos > 0 else 0)
         
         # Get previous week's total_time for comparison
         prev_week_start = week_start - timedelta(days=7)
@@ -4648,152 +5636,240 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
             .first()
         )
         if prev_report and prev_report.total_time:
-            report.pre_total_time = prev_report.total_time
+            report.pre_total_time = _total_time_to_minutes(prev_report.total_time)
 
-        # Use weekly trends for discovery_rank / trend_name / trend_type
-        if global_report_id:
-            top_creators = summary.get("top_creators") or []
-            top_music_items = summary.get("top_music") or []
-            creator_trends = (
-                db.query(WeeklyTrendCreator)
-                .filter(WeeklyTrendCreator.global_report_id == global_report_id)
-                .order_by(WeeklyTrendCreator.rank)
-                .all()
+        # Apply global trend-discovery result (creator/sound/hashtag + ranking/penetration/variant copy).
+        trend_discovery = global_analysis.get("trend_discovery") if isinstance(global_analysis, dict) else None
+        per_user_discovery = trend_discovery.get("per_user") if isinstance(trend_discovery, dict) else None
+        user_trend_data = per_user_discovery.get(app_user_id) if isinstance(per_user_discovery, dict) else None
+        trend_variant: Optional[str] = None
+        if isinstance(user_trend_data, dict):
+            trend_variant = _safe_str(user_trend_data.get("variant")) or None
+            report.trend_type = _safe_str(user_trend_data.get("trend_type")) or None
+            report.trend_name = _safe_str(user_trend_data.get("trend_name")) or None
+            report.discovery_rank = (
+                int(user_trend_data.get("discovery_rank"))
+                if user_trend_data.get("discovery_rank") is not None
+                else None
             )
-            sound_trends = (
-                db.query(WeeklyTrendSound)
-                .filter(WeeklyTrendSound.global_report_id == global_report_id)
-                .order_by(WeeklyTrendSound.rank)
-                .all()
+            report.total_discoverers = (
+                int(user_trend_data.get("total_discoverers"))
+                if user_trend_data.get("total_discoverers") is not None
+                else None
             )
+            report.origin_niche_text = _safe_str(user_trend_data.get("origin_niche_text")) or None
+            report.spread_end_text = _safe_str(user_trend_data.get("spread_end_text")) or None
+            report.reach_start = (
+                float(user_trend_data.get("reach_start"))
+                if user_trend_data.get("reach_start") is not None
+                else None
+            )
+            report.reach_end = (
+                float(user_trend_data.get("reach_end"))
+                if user_trend_data.get("reach_end") is not None
+                else None
+            )
+            report.current_reach = (
+                float(user_trend_data.get("current_reach"))
+                if user_trend_data.get("current_reach") is not None
+                else None
+            )
+        else:
+            fallback_candidate: Optional[TrendCandidate] = None
+            if global_report_id:
+                with suppress(Exception):
+                    fallback_candidates = _build_weekly_trend_candidates(db, int(global_report_id))
+                    if fallback_candidates:
+                        fallback_candidate = sorted(fallback_candidates, key=lambda c: (c.rank, c.key))[0]
+            report.trend_type = fallback_candidate.trend_type if fallback_candidate else "sound"
+            report.trend_name = fallback_candidate.trend_name if fallback_candidate else "Unknown Trend"
+            report.discovery_rank = None
+            report.total_discoverers = None
+            report.origin_niche_text = "This blew up but your feed missed it."
+            report.spread_end_text = "Your taste might be more niche than you think."
+            report.reach_start = (
+                float(fallback_candidate.reach_start_hint)
+                if fallback_candidate and fallback_candidate.reach_start_hint is not None
+                else 0.0
+            )
+            report.reach_end = (
+                float(fallback_candidate.reach_end_hint)
+                if fallback_candidate and fallback_candidate.reach_end_hint is not None
+                else 0.0
+            )
+            if (report.reach_end or 0.0) < (report.reach_start or 0.0):
+                report.reach_end = report.reach_start
+            report.current_reach = report.reach_end
 
-            def _norm(s: Optional[str]) -> str:
-                return (s or "").strip().lower()
+        if not _safe_str(report.trend_name) or not _safe_str(report.trend_type):
+            fallback_candidate: Optional[TrendCandidate] = None
+            if global_report_id:
+                with suppress(Exception):
+                    fallback_candidates = _build_weekly_trend_candidates(db, int(global_report_id))
+                    if fallback_candidates:
+                        fallback_candidate = sorted(fallback_candidates, key=lambda c: (c.rank, c.key))[0]
+            if fallback_candidate:
+                report.trend_name = report.trend_name or fallback_candidate.trend_name
+                report.trend_type = report.trend_type or fallback_candidate.trend_type
+                if report.reach_start is None and fallback_candidate.reach_start_hint is not None:
+                    report.reach_start = float(fallback_candidate.reach_start_hint)
+                if report.reach_end is None and fallback_candidate.reach_end_hint is not None:
+                    report.reach_end = float(fallback_candidate.reach_end_hint)
+                if report.current_reach is None:
+                    report.current_reach = report.reach_end
 
-            best_rank: Optional[int] = None
-            best_type: Optional[str] = None
-            best_name: Optional[str] = None
+        # Prefer raw watch-history rows for weekly topic/rabbit analysis.
+        weekly_items: List[Dict[str, Any]] = [_history_row_to_topic_item(row) for row in weekly_rows]
+        baseline_rows: List[Dict[str, Any]] = []
+        for row in history_rows:
+            watched_at = _parse_watched_at_value(row.get("watched_at")) if isinstance(row, dict) else None
+            if watched_at and baseline_start <= watched_at < analysis_start:
+                baseline_rows.append(row)
+        baseline_items: List[Dict[str, Any]] = [_history_row_to_topic_item(row) for row in baseline_rows]
 
-            for c in top_creators:
-                if not isinstance(c, dict):
-                    continue
-                author_id = str(c.get("author_id") or "")
-                if not author_id:
-                    continue
-                for t in creator_trends:
-                    if t.user_id and t.user_id == author_id:
-                        if best_rank is None or t.rank < best_rank:
-                            best_rank = t.rank
-                            best_type = "creator"
-                            best_name = t.nick_name or ""
-                        break
+        # Fallback to analytics samples when history rows are insufficient.
+        weekly_sample_limit = min(200, max(80, int(os.getenv("WEEKLY_REPORT_USER_SAMPLE_LIMIT", "320"))))
+        if not weekly_items:
+            try:
+                samples = await archive_client.watch_history_analytics_samples(
+                    sec_user_id=user.latest_sec_user_id,
+                    range=range_spec,
+                    time_zone=user.time_zone or "UTC",
+                    strategy={"type": "recent"},
+                    limit=weekly_sample_limit,
+                    max_chars_per_item=300,
+                    fields=["title", "description", "hashtags", "music", "author"],
+                    include_video_id=False,
+                    include_watched_at=True,
+                )
+                items = samples.get("items") if isinstance(samples, dict) else None
+                if isinstance(items, list):
+                    weekly_items = [it for it in items if isinstance(it, dict)]
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.samples_failed",
+                    extra={"event": "weekly_report_user_analyze.samples_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
 
-            for m in top_music_items:
-                if not isinstance(m, dict):
-                    continue
-                music_name = _norm(m.get("music"))
-                if not music_name:
-                    continue
-                for t in sound_trends:
-                    if t.title and _norm(t.title) == music_name:
-                        if best_rank is None or t.rank < best_rank:
-                            best_rank = t.rank
-                            best_type = "song"
-                            best_name = t.title or ""
-                        break
+        if not baseline_items:
+            baseline_range = {"type": "between", "start_at": _iso_utc(baseline_start), "end_at": _iso_utc(analysis_start)}
+            try:
+                baseline_samples = await archive_client.watch_history_analytics_samples(
+                    sec_user_id=user.latest_sec_user_id,
+                    range=baseline_range,
+                    time_zone=user.time_zone or "UTC",
+                    strategy={"type": "recent"},
+                    limit=weekly_sample_limit,
+                    max_chars_per_item=300,
+                    fields=["title", "description", "hashtags", "music", "author"],
+                    include_video_id=False,
+                    include_watched_at=False,
+                )
+                baseline_raw = baseline_samples.get("items") if isinstance(baseline_samples, dict) else None
+                if isinstance(baseline_raw, list):
+                    baseline_items = [it for it in baseline_raw if isinstance(it, dict)]
+            except Exception as exc:
+                logger.warning(
+                    "weekly_report_user_analyze.baseline_samples_failed",
+                    extra={"event": "weekly_report_user_analyze.baseline_samples_failed", "app_user_id": app_user_id, "error": str(exc)},
+                )
 
-            if best_rank is not None:
-                report.discovery_rank = best_rank
-                report.total_discoverers = 100
-                report.trend_type = best_type
-                report.trend_name = best_name
-
-        # Fetch sample data for LLM analysis
-        sample_texts: List[str] = []
+        brainrot_pct = 0.0
         try:
-            samples = await archive_client.watch_history_analytics_samples(
+            interests_summary = await archive_client.interests_summary(
                 sec_user_id=user.latest_sec_user_id,
                 range=range_spec,
                 time_zone=user.time_zone or "UTC",
-                strategy={"type": "recent"},
-                limit=50,
-                max_chars_per_item=300,
-                fields=["title", "description", "hashtags", "music", "author"],
-                include_video_id=False,
-                include_watched_at=False,
+                group_by="none",
+                limit=10,
+                include_unknown=True,
             )
-            items = samples.get("items") if isinstance(samples, dict) else None
-            if isinstance(items, list):
-                sample_texts = [str(it.get("text") or "").strip() for it in items if isinstance(it, dict)]
-                sample_texts = [t for t in sample_texts if t]
+            brainrot_pct = extract_brainrot_pct(interests_summary)
         except Exception as exc:
             logger.warning(
-                "weekly_report_user_analyze.samples_failed",
-                extra={"event": "weekly_report_user_analyze.samples_failed", "app_user_id": app_user_id, "error": str(exc)},
+                "weekly_report_user_analyze.interests_summary_failed",
+                extra={"event": "weekly_report_user_analyze.interests_summary_failed", "app_user_id": app_user_id, "error": str(exc)},
             )
-        
-        # LLM analysis (only if we have sample data)
-        if sample_texts:
-            # 1. Feeding state analysis
-            try:
-                feeding_result = await _call_llm(WEEKLY_FEEDING_STATE_PROMPT, sample_texts, temperature=0.3)
-                feeding_state = feeding_result.strip().lower()
-                if feeding_state in ("curious", "excited", "cozy", "sleepy", "dizzy"):
-                    report.feeding_state = feeding_state
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_user_analyze.feeding_state_failed",
-                    extra={"event": "weekly_report_user_analyze.feeding_state_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-            
-            # 2. Topics analysis
-            try:
-                topics_result = await _call_llm(WEEKLY_TOPICS_PROMPT, sample_texts, temperature=0.5)
-                topics_data = _extract_json_value(topics_result)
-                if isinstance(topics_data, list):
-                    topics = []
-                    for item in topics_data[:3]:
-                        if isinstance(item, dict) and item.get("topic"):
-                            topics.append({"topic": str(item["topic"]), "pic_url": ""})
-                        elif isinstance(item, str):
-                            topics.append({"topic": item, "pic_url": ""})
-                    if topics:
-                        report.topics = topics
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_user_analyze.topics_failed",
-                    extra={"event": "weekly_report_user_analyze.topics_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-            
-            # 3. Rabbit hole analysis
-            try:
-                rabbit_result = await _call_llm(WEEKLY_RABBIT_HOLE_PROMPT, sample_texts, temperature=0.3)
-                rabbit_data = _extract_json_value(rabbit_result)
-                if isinstance(rabbit_data, dict):
-                    category = rabbit_data.get("category")
-                    count = rabbit_data.get("count")
-                    if category and isinstance(category, str):
-                        report.rabbit_hole_category = category
-                        if isinstance(count, (int, float)):
-                            report.rabbit_hole_count = int(count)
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_user_analyze.rabbit_hole_failed",
-                    extra={"event": "weekly_report_user_analyze.rabbit_hole_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-            
-            # 4. Nudge text analysis
-            try:
-                nudge_result = await _call_llm(WEEKLY_NUDGE_PROMPT, sample_texts, temperature=0.7)
-                nudge_text = nudge_result.strip()
-                if nudge_text and len(nudge_text) <= 80:
-                    report.nudge_text = nudge_text
-            except Exception as exc:
-                logger.warning(
-                    "weekly_report_user_analyze.nudge_failed",
-                    extra={"event": "weekly_report_user_analyze.nudge_failed", "app_user_id": app_user_id, "error": str(exc)},
-                )
-        
+
+        topics = _attach_topic_images(db, derive_new_topics(weekly_items, baseline_items))
+        rabbit = derive_rabbit_hole(weekly_items, tz_name=user.time_zone or "UTC")
+        rabbit_count = int(rabbit.get("count") or 0)
+        rabbit_category = _safe_str(rabbit.get("category")) or None
+        rabbit_start = rabbit.get("start_at")
+        rabbit_day = _safe_str(rabbit.get("day")) or None
+        rabbit_time = _safe_str(rabbit.get("time")) or None
+
+        diversity_score = compute_content_diversity_score(weekly_items)
+        feeding_state = derive_feedling_state(
+            trend_variant=trend_variant,
+            diversity_score=diversity_score,
+            new_topic_count=len(topics),
+            total_time=report.total_time or 0,
+            pre_total_time=report.pre_total_time,
+            rabbit_hole_count=rabbit_count,
+            miles_scrolled=report.miles_scrolled or 0,
+            brainrot_pct=brainrot_pct,
+        )
+        nudge_text = derive_nudge_text(
+            rabbit_hole_count=rabbit_count,
+            rabbit_hole_time=rabbit_time,
+            miles_scrolled=report.miles_scrolled or 0,
+            brainrot_pct=brainrot_pct,
+            total_time=report.total_time or 0,
+            pre_total_time=report.pre_total_time,
+        )
+
+        # Hybrid mode: deterministic analysis first, then let LLM refine semantics.
+        llm_updates: Dict[str, Any] = {}
+        llm_topics_overrode = False
+        with suppress(Exception):
+            llm_updates = await _run_weekly_llm_refinement(weekly_items=weekly_items)
+
+        llm_topics = llm_updates.get("topics")
+        if isinstance(llm_topics, list) and llm_topics:
+            topics = _attach_topic_images(db, llm_topics)
+            llm_topics_overrode = True
+
+        llm_rabbit_category = _safe_str(llm_updates.get("rabbit_category")) or None
+        llm_rabbit_count_raw = llm_updates.get("rabbit_count")
+        llm_rabbit_count: Optional[int] = None
+        with suppress(Exception):
+            if llm_rabbit_count_raw is not None:
+                llm_rabbit_count = int(llm_rabbit_count_raw)
+        if llm_rabbit_category and llm_rabbit_count and llm_rabbit_count > 0:
+            rabbit_category = llm_rabbit_category
+            rabbit_count = llm_rabbit_count
+
+        llm_feeding_state = _safe_str(llm_updates.get("feeding_state")).lower()
+        if llm_feeding_state in {"curious", "excited", "cozy", "sleepy", "dizzy"}:
+            feeding_state = llm_feeding_state
+
+        llm_nudge_text = _safe_str(llm_updates.get("nudge_text"))
+        if llm_nudge_text:
+            nudge_text = llm_nudge_text
+
+        report.topics = topics if topics else None
+        report.rabbit_hole_count = rabbit_count if rabbit_count > 0 else None
+        report.rabbit_hole_category = rabbit_category
+        report.rabbit_hole_datetime = rabbit_start if isinstance(rabbit_start, datetime) else None
+        report.rabbit_hole_date = rabbit_day
+        report.rabbit_hole_time = rabbit_time
+        report.feeding_state = feeding_state
+        report.nudge_text = nudge_text
+
+        logger.info(
+            "weekly_report_user_analyze.hybrid_applied",
+            extra={
+                "event": "weekly_report_user_analyze.hybrid_applied",
+                "app_user_id": app_user_id,
+                "llm_enabled": WEEKLY_REPORT_LLM_REFINEMENT_ENABLED,
+                "llm_topics_overrode": llm_topics_overrode,
+                "llm_rabbit_overrode": bool(llm_rabbit_category and llm_rabbit_count and llm_rabbit_count > 0),
+                "llm_feeding_overrode": bool(llm_feeding_state in {"curious", "excited", "cozy", "sleepy", "dizzy"}),
+                "llm_nudge_overrode": bool(llm_nudge_text),
+            },
+        )
+
         # TODO: Use global_analysis for per-user comparative metrics
         # For example: calculate user's percentile vs global average
         # if global_analysis.get("avg_watch_hours_per_user"):
@@ -4898,14 +5974,16 @@ async def handle_weekly_report_batch_send(job: LeasedJob) -> bool:
         db.commit()
         
         # Get all user reports that were analyzed
-        user_reports = (
+        user_reports_query = (
             db.query(WeeklyReport)
             .filter(
                 WeeklyReport.global_report_id == global_report_id,
                 WeeklyReport.analyze_status == "analyzed",
             )
-            .all()
         )
+        if isinstance(limit_to_app_user_ids, list) and limit_to_app_user_ids:
+            user_reports_query = user_reports_query.filter(WeeklyReport.app_user_id.in_(limit_to_app_user_ids))
+        user_reports = user_reports_query.all()
         
         if not user_reports:
             logger.info(
@@ -5015,8 +6093,6 @@ async def handle_job(job: LeasedJob) -> bool:
             return await handle_email_send(job)
         if job.task_name == "watch_history_verify":
             return await handle_watch_history_verify(job)
-        if job.task_name == "weekly_report_analyze":
-            return await handle_weekly_report_analyze(job)
         if job.task_name == "weekly_report_send":
             return await handle_weekly_report_send(job)
         # Batch processing handlers
@@ -5056,17 +6132,21 @@ async def handle_job(job: LeasedJob) -> bool:
 
 
 def _lease_next_job(worker_id: str, lease_seconds: int) -> Optional[LeasedJob]:
-    with SessionLocal() as db:
-        leased = job_queue.lease(
-            db,
-            worker_id=worker_id,
-            lease_seconds=lease_seconds,
-            task_names=WORKER_TASK_ALLOW or None,
-        )
-        if not leased:
-            return None
-        payload = leased.payload if isinstance(leased.payload, dict) else {}
-        return LeasedJob(id=leased.id, task_name=leased.task_name, payload=payload)
+    try:
+        with SessionLocal() as db:
+            leased = job_queue.lease(
+                db,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+                task_names=WORKER_TASK_ALLOW or None,
+            )
+            if not leased:
+                return None
+            payload = leased.payload if isinstance(leased.payload, dict) else {}
+            return LeasedJob(id=leased.id, task_name=leased.task_name, payload=payload)
+    except Exception:
+        logger.exception("worker.lease.exception", extra={"event": "worker.lease.exception", "worker_id": worker_id})
+        return None
 
 
 async def _lease_heartbeat(job_id: str, worker_id: str, interval_seconds: float, lease_seconds: int) -> None:

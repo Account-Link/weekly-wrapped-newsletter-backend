@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import logging
 from html import escape
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,8 @@ _OPEN_WRAPPED_LINK_BY_CLASS_RE = re.compile(
     r'(<a\b[^>]*\bclass=["\'][^"\']*\bopen-buttton\b[^"\']*["\'][^>]*\bhref=["\'])#(["\'])',
     flags=re.IGNORECASE,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Emailer:
@@ -178,7 +181,32 @@ class Emailer:
                     **kwargs,
                 )
                 return resp
-            except (BotoCoreError, ClientError):
+            except ClientError as exc:
+                err = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
+                logger.warning(
+                    "email.send.client_error",
+                    extra={
+                        "event": "email.send.client_error",
+                        "attempt": attempts,
+                        "to_address": to_address,
+                        "error_code": err.get("Code"),
+                        "error_message": err.get("Message"),
+                    },
+                )
+                if attempts >= 3:
+                    return None
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 4.0)
+            except BotoCoreError as exc:
+                logger.warning(
+                    "email.send.boto_error",
+                    extra={
+                        "event": "email.send.boto_error",
+                        "attempt": attempts,
+                        "to_address": to_address,
+                        "error": str(exc),
+                    },
+                )
                 if attempts >= 3:
                     return None
                 time.sleep(backoff)

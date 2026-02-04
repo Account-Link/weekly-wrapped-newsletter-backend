@@ -190,11 +190,35 @@ class WeeklyReport(Base):
     nudge_text = Column(String, nullable=True)
 
 
+class TikTokRadarHeaderConfig(Base):
+    """Manually managed headers for TikTok Creative Radar requests."""
+    __tablename__ = "tiktok_radar_header_config"
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    cookie = Column(Text, nullable=True)
+    user_sign = Column(String, nullable=True)
+    web_id = Column(String, nullable=True)
+    creator_cookie = Column(Text, nullable=True)
+    creator_user_sign = Column(String, nullable=True)
+    creator_web_id = Column(String, nullable=True)
+    sound_cookie = Column(Text, nullable=True)
+    sound_user_sign = Column(String, nullable=True)
+    sound_web_id = Column(String, nullable=True)
+    hashtag_cookie = Column(Text, nullable=True)
+    hashtag_user_sign = Column(String, nullable=True)
+    hashtag_web_id = Column(String, nullable=True)
+    country_code = Column(String, nullable=False, default="US")
+    updated_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class WeeklyTrendHashtag(Base):
     """Weekly top 100 hashtags from TikTok Creative Radar for a given global report."""
     __tablename__ = "weekly_trend_hashtag"
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     global_report_id = Column(Integer, nullable=False, index=True)
+    period_start = Column(DateTime, nullable=True)  # 周一 00:00 UTC
+    period_end = Column(DateTime, nullable=True)  # 下周一 00:00 UTC
     rank = Column(Integer, nullable=False)
     hashtag_id = Column(String, nullable=True)
     hashtag_name = Column(String, nullable=True)
@@ -215,6 +239,8 @@ class WeeklyTrendSound(Base):
     __tablename__ = "weekly_trend_sound"
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     global_report_id = Column(Integer, nullable=False, index=True)
+    period_start = Column(DateTime, nullable=True)  # 周一 00:00 UTC
+    period_end = Column(DateTime, nullable=True)  # 下周一 00:00 UTC
     rank = Column(Integer, nullable=False)
     clip_id = Column(String, nullable=True)
     song_id = Column(String, nullable=True)
@@ -234,6 +260,8 @@ class WeeklyTrendCreator(Base):
     __tablename__ = "weekly_trend_creator"
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     global_report_id = Column(Integer, nullable=False, index=True)
+    period_start = Column(DateTime, nullable=True)  # 周一 00:00 UTC
+    period_end = Column(DateTime, nullable=True)  # 下周一 00:00 UTC
     rank = Column(Integer, nullable=False)
     tcm_id = Column(String, nullable=True)
     user_id = Column(String, nullable=True, index=True)

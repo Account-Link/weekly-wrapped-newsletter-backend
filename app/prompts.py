@@ -153,7 +153,7 @@ WEEKLY_RABBIT_HOLE_PROMPT = (
     "Return ONLY valid JSON:\n"
     "If rabbit hole detected: {\"category\": \"topic name\", \"count\": estimated_video_count}\n"
     "If no rabbit hole: {\"category\": null, \"count\": 0}\n\n"
-    "A rabbit hole means: watched 10+ videos on one narrow topic in a short time.\n"
+    "A rabbit hole means: watched 20+ videos on one narrow topic in a short time.\n"
     "The category should be specific (e.g., 'ASMR Soap Cutting' not just 'ASMR').\n\n"
     "No markdown, no extra keys, no explanation."
 )

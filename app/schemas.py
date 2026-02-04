@@ -567,7 +567,10 @@ class UploadResponse(BaseModel):
 class WeeklyReportTestRequest(BaseModel):
     send_email: bool = False  # Whether to send the email after generating the report (default: False for safety)
     email: Optional[EmailStr] = None  # Override email address (for testing, instead of user's email)
-    use_batch_flow: bool = False  # If True, trigger full pipeline: fetch_trends -> user_fetch -> analyze -> send (single user)
+    use_batch_flow: bool = True  # Deprecated: ignored. Test endpoint always uses batch pipeline.
+    force_new_global_report: bool = False  # If True (batch flow only), always create a new WeeklyReportGlobal for this run
+    period_start: Optional[datetime] = None  # Optional custom period start for single-user test runs
+    period_end: Optional[datetime] = None  # Optional custom period end for single-user test runs
 
 
 class WeeklyReportTestResponse(BaseModel):
@@ -580,3 +583,4 @@ class WeeklyReportTestResponse(BaseModel):
     report: WeeklyReportResponse
     use_batch_flow: bool = False  # True when full pipeline (fetch_trends -> ... -> send) was triggered
     fetch_trends_job_id: Optional[str] = None  # Set when use_batch_flow=True
+    global_report_id: Optional[int] = None
