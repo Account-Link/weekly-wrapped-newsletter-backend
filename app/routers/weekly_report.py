@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Form, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Response, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -500,14 +500,26 @@ def _extract_trend_items(raw_text: str, trend_type: str) -> Dict[str, Any]:
     tags=["weekly-report"],
 )
 async def get_weekly_report(
-    app_user_id: str, db: Session = Depends(get_db)
+    app_user_id: str,
+    period_start: Optional[datetime] = Query(None),
+    period_end: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
 ) -> WeeklyReportResponse:
-    report = (
-        db.query(WeeklyReport)
-        .filter(WeeklyReport.app_user_id == app_user_id)
-        .order_by(WeeklyReport.created_at.desc())
-        .first()
-    )
+    if (period_start is None) ^ (period_end is None):
+        raise HTTPException(status_code=400, detail="period_start_and_period_end_must_be_provided_together")
+
+    query = db.query(WeeklyReport).filter(WeeklyReport.app_user_id == app_user_id)
+    if period_start is not None and period_end is not None:
+        week_start = _to_naive_utc(period_start).replace(microsecond=0)
+        week_end = _to_naive_utc(period_end).replace(microsecond=0)
+        if week_start > week_end:
+            raise HTTPException(status_code=400, detail="period_start_must_be_before_or_equal_to_period_end")
+        query = query.filter(
+            WeeklyReport.period_start == week_start,
+            WeeklyReport.period_end == week_end,
+        )
+
+    report = query.order_by(WeeklyReport.created_at.desc()).first()
     if not report:
         raise HTTPException(status_code=404, detail="not_found")
     
