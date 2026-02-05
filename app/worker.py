@@ -50,7 +50,6 @@ from app.prompts import (
     ROAST_THUMB_PROMPT,
     TOP_NICHES_PROMPT,
     WEEKLY_FEEDING_STATE_PROMPT,
-    WEEKLY_NUDGE_PROMPT,
     WEEKLY_RABBIT_HOLE_PROMPT,
     WEEKLY_TOPICS_PROMPT,
     accessory_fallback_reason,
@@ -1513,11 +1512,10 @@ async def _run_weekly_llm_refinement(
             return await _call_llm(prompt, sample_texts, temperature=temp)
         return ""
 
-    topics_raw, rabbit_raw, feeding_raw, nudge_raw = await asyncio.gather(
+    topics_raw, rabbit_raw, feeding_raw = await asyncio.gather(
         _safe_call(WEEKLY_TOPICS_PROMPT, 0.4),
         _safe_call(WEEKLY_RABBIT_HOLE_PROMPT, 0.2),
         _safe_call(WEEKLY_FEEDING_STATE_PROMPT, 0.1),
-        _safe_call(WEEKLY_NUDGE_PROMPT, 0.6),
     )
 
     llm_topics = _normalize_llm_topic_items(_extract_json_value(topics_raw))
@@ -1540,16 +1538,12 @@ async def _run_weekly_llm_refinement(
     if llm_feeding_state not in {"curious", "excited", "cozy", "sleepy", "dizzy"}:
         llm_feeding_state = ""
 
-    llm_nudge = _safe_str(nudge_raw).replace("\n", " ").strip()
-    if llm_nudge and len(llm_nudge) > 80:
-        llm_nudge = llm_nudge[:80].rstrip()
-
     return {
         "topics": llm_topics,
         "rabbit_category": llm_rabbit_category,
         "rabbit_count": llm_rabbit_count,
         "feeding_state": llm_feeding_state or None,
-        "nudge_text": llm_nudge or None,
+        "nudge_text": None,
     }
 
 
@@ -4455,6 +4449,19 @@ def _get_or_create_global_report(db, week_start: datetime, week_end: datetime) -
     return global_report
 
 
+def _effective_app_user_count(db) -> int:
+    count = (
+        db.query(func.count(AppUser.app_user_id))
+        .filter(
+            AppUser.weekly_report_unsubscribed == False,
+            AppUser.latest_sec_user_id.isnot(None),
+            AppUser.latest_sec_user_id != "",
+        )
+        .scalar()
+    )
+    return int(count or 0)
+
+
 async def handle_weekly_report_fetch_trends(job: LeasedJob) -> bool:
     """Fetch TikTok Creative Radar top 100 (hashtag/sound/creator), persist, then enqueue batch_fetch.
     
@@ -5875,6 +5882,11 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
         # if global_analysis.get("avg_watch_hours_per_user"):
         #     user_percentile = calculate_percentile(total_hours, global_analysis["avg_watch_hours_per_user"])
         
+        effective_total_discoverers = _effective_app_user_count(db)
+        email_total_discoverers = (
+            effective_total_discoverers if effective_total_discoverers > 0 else report.total_discoverers
+        )
+
         # Call external Node.js service to generate email HTML content
         node_url = (os.getenv("WEEKLY_REPORT_NODE_URL") or "").strip()
         if node_url:
@@ -5892,7 +5904,7 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
                     "trend_name": report.trend_name,
                     "trend_type": report.trend_type,
                     "discovery_rank": report.discovery_rank,
-                    "total_discoverers": report.total_discoverers,
+                    "total_discoverers": email_total_discoverers,
                     "origin_niche_text": report.origin_niche_text,
                     "spread_end_text": report.spread_end_text,
                     "reach_start": report.reach_start,

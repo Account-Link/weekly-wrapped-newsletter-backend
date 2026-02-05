@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Response, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from datetime import timedelta
@@ -65,6 +66,19 @@ def _weekly_trends_ready(db: Session, global_report_id: int) -> bool:
     sound_count = db.query(WeeklyTrendSound).filter(WeeklyTrendSound.global_report_id == global_report_id).count()
     creator_count = db.query(WeeklyTrendCreator).filter(WeeklyTrendCreator.global_report_id == global_report_id).count()
     return hashtag_count > 0 and sound_count > 0 and creator_count > 0
+
+
+def _effective_app_user_count(db: Session) -> int:
+    count = (
+        db.query(func.count(AppUser.app_user_id))
+        .filter(
+            AppUser.weekly_report_unsubscribed == False,
+            AppUser.latest_sec_user_id.isnot(None),
+            AppUser.latest_sec_user_id != "",
+        )
+        .scalar()
+    )
+    return int(count or 0)
 
 
 def _to_naive_utc(value: datetime) -> datetime:
@@ -531,6 +545,8 @@ async def get_weekly_report(
         except Exception:
             topics = None
     
+    effective_total_discoverers = _effective_app_user_count(db)
+
     return WeeklyReportResponse(
         id=report.id,
         app_user_id=report.app_user_id,
@@ -544,7 +560,7 @@ async def get_weekly_report(
         trend_name=report.trend_name,
         trend_type=report.trend_type,
         discovery_rank=report.discovery_rank,
-        total_discoverers=report.total_discoverers,
+        total_discoverers=effective_total_discoverers if effective_total_discoverers > 0 else report.total_discoverers,
         origin_niche_text=report.origin_niche_text,
         spread_end_text=report.spread_end_text,
         reach_start=report.reach_start,
@@ -926,6 +942,8 @@ async def admin_test_weekly_report(
         except Exception:
             topics = None
     
+    effective_total_discoverers = _effective_app_user_count(db)
+
     report_response = WeeklyReportResponse(
         id=report.id,
         app_user_id=report.app_user_id,
@@ -939,7 +957,7 @@ async def admin_test_weekly_report(
         trend_name=report.trend_name,
         trend_type=report.trend_type,
         discovery_rank=report.discovery_rank,
-        total_discoverers=report.total_discoverers,
+        total_discoverers=effective_total_discoverers if effective_total_discoverers > 0 else report.total_discoverers,
         origin_niche_text=report.origin_niche_text,
         spread_end_text=report.spread_end_text,
         reach_start=report.reach_start,
