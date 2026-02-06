@@ -2342,6 +2342,34 @@ def _build_analogy_line(total_videos: int) -> str:
     return f"Your thumb ran **{miles_label} miles** on the screen — {suffix}"
 
 
+def _weekly_scroll_feet(total_videos: int) -> int:
+    total_videos = max(0, int(total_videos or 0))
+    return int(round(total_videos * 0.5))
+
+
+def _build_miles_scrolled_text(total_videos: int) -> str:
+    feet = _weekly_scroll_feet(total_videos)
+
+    if feet < 600:
+        suffix = "a short hallway."
+    elif feet < 800:
+        suffix = "two Statues of Liberty stacked."
+    elif feet < 1100:
+        suffix = "three Statues of Liberty stacked."
+    elif feet < 1500:
+        suffix = "taller than the Eiffel Tower."
+    elif feet < 2000:
+        suffix = "taller than Empire State Building."
+    elif feet < 3000:
+        suffix = "almost a kilometer."
+    elif feet < 5280:
+        suffix = "longer than 10 football fields."
+    else:
+        return "Your thumb scrolled over a mile. Touch grass?"
+
+    return f"Your thumb scrolled {feet} ft — {suffix}"
+
+
 def _format_hour_ampm(hour: int) -> str:
     hour = int(hour) % 24
     suffix = "AM" if hour < 12 else "PM"
@@ -5621,13 +5649,8 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
         report.total_time = int(round(total_hours * 60))
         report.timezone = user.time_zone or "UTC"
 
-        # Keep weekly-report mile logic aligned with wrapped "thumb roast" logic.
-        videos_per_mile = 180.0
-        with suppress(Exception):
-            videos_per_mile = float(os.getenv("THUMB_VIDEOS_PER_MILE", "180"))
-        videos_per_mile = max(10.0, min(videos_per_mile, 10000.0))
-        miles = int(round((total_videos or 0) / videos_per_mile)) if total_videos else 0
-        report.miles_scrolled = miles if miles > 0 else (1 if total_videos > 0 else 0)
+        # weekly_report.miles_scrolled now stores weekly scroll distance in feet.
+        report.miles_scrolled = _weekly_scroll_feet(total_videos)
         
         # Get previous week's total_time for comparison
         prev_week_start = week_start - timedelta(days=7)
@@ -5899,6 +5922,7 @@ async def handle_weekly_report_user_analyze(job: LeasedJob) -> bool:
                     "total_time": report.total_time,
                     "pre_total_time": report.pre_total_time,
                     "miles_scrolled": report.miles_scrolled,
+                    "miles_scrolled_text": _build_miles_scrolled_text(report.total_videos or 0),
                     "feeding_state": report.feeding_state,
                     "topics": report.topics,
                     "trend_name": report.trend_name,

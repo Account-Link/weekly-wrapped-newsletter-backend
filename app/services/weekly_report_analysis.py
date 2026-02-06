@@ -12,6 +12,7 @@ WEEKLY_TOPIC_STOPWORDS: Set[str] = {
     "was", "were", "into", "how", "why", "what", "when", "where", "best", "new",
     "tips", "guide", "video", "videos", "shorts", "tiktok", "part", "episode",
 }
+HIGH_SCROLL_FEET_THRESHOLD = 1500
 
 
 def _safe_zone(tz_name: Optional[str]) -> ZoneInfo:
@@ -290,7 +291,7 @@ def derive_feedling_state(
         return "curious"
     if pre_total_time and total_time < pre_total_time and rabbit_hole_count <= 100:
         return "cozy"
-    if rabbit_hole_count > 100 or miles_scrolled > 26:
+    if rabbit_hole_count > 100 or miles_scrolled > HIGH_SCROLL_FEET_THRESHOLD:
         return "sleepy"
     if brainrot_pct > 20.0:
         return "dizzy"
@@ -314,7 +315,7 @@ def derive_nudge_text(
                 suffix = "AM" if "AM" in rabbit_hole_time.upper() else "PM"
                 return f"Try putting your phone down before {hour} {suffix} this week"
         return "When you notice the drift, try searching for something specific"
-    if miles_scrolled > 26:
+    if miles_scrolled > HIGH_SCROLL_FEET_THRESHOLD:
         return "Try setting a scroll limit for yourself"
     if brainrot_pct > 25.0:
         return 'Try using "Not Interested" on a few videos this week'

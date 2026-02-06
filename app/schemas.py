@@ -520,7 +520,6 @@ class TopicItem(BaseModel):
 class WeeklyReportResponse(BaseModel):
     id: int
     app_user_id: str
-    email_content: Optional[str] = None
     period_start: Optional[datetime] = None
     period_end: Optional[datetime] = None
     created_at: datetime

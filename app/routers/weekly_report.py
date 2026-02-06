@@ -550,7 +550,6 @@ async def get_weekly_report(
     return WeeklyReportResponse(
         id=report.id,
         app_user_id=report.app_user_id,
-        email_content=report.email_content,
         period_start=report.period_start,
         period_end=report.period_end,
         created_at=report.created_at,
@@ -947,7 +946,6 @@ async def admin_test_weekly_report(
     report_response = WeeklyReportResponse(
         id=report.id,
         app_user_id=report.app_user_id,
-        email_content=report.email_content,
         period_start=report.period_start,
         period_end=report.period_end,
         created_at=report.created_at,
